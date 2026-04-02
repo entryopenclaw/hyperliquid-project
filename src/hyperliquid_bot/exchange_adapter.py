@@ -16,7 +16,7 @@ LOGGER = logging.getLogger(__name__)
 class AdapterClients:
     info: Any
     stream: Any
-    exchange: Any
+    exchange: Any | None
     constants: Any
 
 
@@ -28,27 +28,17 @@ class HyperliquidAdapter:
         self.clients: AdapterClients | None = None
         self.account_address = config.hyperliquid.account_address
 
-    def connect(self) -> None:
-        if self.clients is not None:
+    def connect(self, *, require_exchange: bool = False) -> None:
+        if self.clients is not None and (self.clients.exchange is not None or not require_exchange):
             return
 
-        if not self.config.secret_key:
-            raise RuntimeError(
-                f"Environment variable {self.config.hyperliquid.secret_key_env} is required to create the exchange client."
-            )
-
         try:
-            from eth_account import Account
-            from hyperliquid.exchange import Exchange
             from hyperliquid.info import Info
             from hyperliquid.utils import constants
         except ImportError as exc:
             raise RuntimeError(
                 "Required dependencies are missing. Install with `pip install -e .[dev]`."
             ) from exc
-
-        wallet = Account.from_key(self.config.secret_key)
-        self.account_address = self.account_address or wallet.address
 
         if self.config.hyperliquid.api_url:
             base_url = self.config.hyperliquid.api_url
@@ -57,14 +47,33 @@ class HyperliquidAdapter:
         else:
             base_url = constants.MAINNET_API_URL
 
-        info = Info(base_url, skip_ws=True)
-        stream = Info(base_url, skip_ws=False)
-        exchange = Exchange(
-            wallet,
-            base_url=base_url,
-            account_address=self.account_address or None,
-            vault_address=self.config.hyperliquid.vault_address or None,
-        )
+        info = self.clients.info if self.clients is not None else Info(base_url, skip_ws=True)
+        stream = self.clients.stream if self.clients is not None else Info(base_url, skip_ws=False)
+        exchange = self.clients.exchange if self.clients is not None else None
+
+        if self.config.secret_key and exchange is None:
+            try:
+                from eth_account import Account
+                from hyperliquid.exchange import Exchange
+            except ImportError as exc:
+                raise RuntimeError(
+                    "Required dependencies are missing. Install with `pip install -e .[dev]`."
+                ) from exc
+
+            wallet = Account.from_key(self.config.secret_key)
+            self.account_address = self.account_address or wallet.address
+            exchange = Exchange(
+                wallet,
+                base_url=base_url,
+                account_address=self.account_address or None,
+                vault_address=self.config.hyperliquid.vault_address or None,
+            )
+
+        if require_exchange and exchange is None:
+            raise RuntimeError(
+                f"Environment variable {self.config.hyperliquid.secret_key_env} is required for live trading."
+            )
+
         self.clients = AdapterClients(info=info, stream=stream, exchange=exchange, constants=constants)
 
     def close(self) -> None:
@@ -90,8 +99,9 @@ class HyperliquidAdapter:
 
     @property
     def _exchange(self) -> Any:
-        self.connect()
+        self.connect(require_exchange=True)
         assert self.clients is not None
+        assert self.clients.exchange is not None
         return self.clients.exchange
 
     def get_meta(self) -> Any:
@@ -128,10 +138,15 @@ class HyperliquidAdapter:
             {"type": "candle", "coin": symbol, "interval": self.config.market.candle_interval},
             {"type": "allMids"},
             {"type": "activeAssetCtx", "coin": symbol},
-            {"type": "orderUpdates", "user": self.account_address},
-            {"type": "userFills", "user": self.account_address},
-            {"type": "userEvents", "user": self.account_address},
         ]
+        if self.account_address:
+            subscriptions.extend(
+                [
+                    {"type": "orderUpdates", "user": self.account_address},
+                    {"type": "userFills", "user": self.account_address},
+                    {"type": "userEvents", "user": self.account_address},
+                ]
+            )
         for subscription in subscriptions:
             sub_type = subscription["type"]
 
@@ -171,6 +186,20 @@ class HyperliquidAdapter:
         return self._exchange.update_leverage(leverage, symbol, is_cross=is_cross)
 
     def build_portfolio_state(self, symbol: str) -> PortfolioState:
+        if not self.account_address:
+            return PortfolioState(
+                timestamp=utc_now(),
+                symbol=symbol,
+                account_value_usd=0.0,
+                position_size=0.0,
+                entry_price=0.0,
+                mark_price=0.0,
+                leverage=0.0,
+                unrealized_pnl_usd=0.0,
+                realized_pnl_usd=0.0,
+                daily_pnl_usd=0.0,
+                open_orders=0,
+            )
         raw_state = self.get_user_state()
         mark_price = 0.0
         position_size = 0.0

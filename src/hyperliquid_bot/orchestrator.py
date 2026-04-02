@@ -39,7 +39,12 @@ class AutonomousBot:
         self.signal = SignalEngine(self._load_model())
         self.policy = PolicyEngine(config.strategy, config.risk, config.execution)
         self.risk = RiskManager(config.risk)
-        self.execution = ExecutionEngine(self.adapter)
+        self.execution = ExecutionEngine(
+            self.adapter,
+            paper_starting_balance_usd=config.execution.paper_starting_balance_usd,
+            paper_fee_bps=config.backtest.fee_bps,
+            paper_slippage_bps=config.backtest.slippage_bps,
+        )
         self.trainer = Trainer(config.training, self.registry)
         self.backtester = BacktestEngine()
         self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -63,12 +68,16 @@ class AutonomousBot:
         return WeightedFeatureModel.from_artifact(artifact) if artifact else None
 
     def bootstrap(self) -> None:
-        self.adapter.connect()
+        if self.config.execution.mode == "live":
+            self.adapter.connect(require_exchange=True)
+        elif self.config.execution.mode == "shadow" and (self.config.secret_key or self.config.hyperliquid.account_address):
+            self.adapter.connect()
         self.monitoring.serve()
-        self.portfolio = self.execution.reconcile(self.config.market.symbol)
+        self.portfolio = self._current_portfolio(mark_price=0.0)
         self.monitoring.set_metric("account_value_usd", self.portfolio.account_value_usd)
         self.monitoring.set_metric("mode", self.config.execution.mode)
         self.monitoring.set_metric("active_model_version", self.signal.model.version)
+        self._update_portfolio_metrics(self.portfolio)
         self._persist_health()
 
     def handle_event(self, stream_type: str, message: Any) -> None:
@@ -110,7 +119,7 @@ class AutonomousBot:
         self.storage.record_feature_row(row)
         prediction = self.signal.predict(feature)
         self.monitoring.set_metric("latest_expected_return_bps", prediction.expected_return_bps)
-        self.portfolio = self.execution.reconcile(self.config.market.symbol)
+        self.portfolio = self._current_portfolio(mark_price=feature.mid_price)
         decision = self.policy.decide(prediction, feature, self.portfolio)
         risk_decision = self.risk.evaluate(decision, self.portfolio, feature)
         if (
@@ -125,17 +134,22 @@ class AutonomousBot:
             self._record_incident("critical", "Kill switch engaged", ", ".join(risk_decision.reasons))
 
         if self.config.execution.mode == "paper":
+            outcome = self.execution.execute_paper(decision, risk_decision, feature)
+            self.portfolio = outcome.portfolio
             report_payload = {
                 "timestamp": utc_now().isoformat(),
                 "symbol": decision.symbol,
                 "action": decision.action,
-                "success": risk_decision.allowed,
+                "success": outcome.report.success,
                 "mode": "paper",
                 "decision": to_jsonable(decision),
                 "risk": to_jsonable(risk_decision),
+                "execution": to_jsonable(outcome.report),
+                "portfolio": to_jsonable(self.portfolio),
             }
             self.storage.record_execution(report_payload)
             self.monitoring.set_metric("last_action", decision.action)
+            self._update_portfolio_metrics(self.portfolio)
             self._persist_health()
             return
 
@@ -151,10 +165,12 @@ class AutonomousBot:
             }
             self.storage.record_execution(report_payload)
             self.monitoring.set_metric("last_action", f"shadow:{decision.action}")
+            self._update_portfolio_metrics(self.portfolio)
             self._persist_health()
             return
 
         report = self.execution.execute(decision, risk_decision, feature)
+        self.portfolio = self._current_portfolio(mark_price=feature.mid_price)
         self.storage.record_execution(to_jsonable(asdict(report)))
         if report.success:
             self.risk.on_success()
@@ -162,6 +178,7 @@ class AutonomousBot:
             self.risk.on_reject()
             self._record_incident("warning", "Execution failure", report.message)
         self.monitoring.set_metric("last_action", report.action)
+        self._update_portfolio_metrics(self.portfolio)
         self._persist_health()
 
     def run(self) -> None:
@@ -213,7 +230,7 @@ class AutonomousBot:
         self._persist_health()
         return payload
 
-    def _maybe_train(self) -> None:
+    def _maybe_train(3elf) -> None:
         if not self.config.training.enabled:
             return
         now = utc_now()
@@ -299,6 +316,19 @@ class AutonomousBot:
     def _persist_health(self) -> None:
         self.monitoring.heartbeat()
         self.storage.record_health(self.monitoring.status())
+
+    def _current_portfolio(self, *, mark_price: float) -> PortfolioState:
+        if self.config.execution.mode == "paper":
+            return self.execution.reconcile(self.config.market.symbol, mark_price=mark_price, use_exchange=False)
+        if self.config.execution.mode == "shadow" and not (self.config.secret_key or self.config.hyperliquid.account_address):
+            return self.execution.reconcile(self.config.market.symbol, mark_price=mark_price, use_exchange=False)
+        return self.execution.reconcile(self.config.market.symbol, use_exchange=True)
+
+    def _update_portfolio_metrics(self, portfolio: PortfolioState) -> None:
+        self.monitoring.set_metric("account_value_usd", portfolio.account_value_usd)
+        self.monitoring.set_metric("position_size", portfolio.position_size)
+        self.monitoring.set_metric("mark_price", portfolio.mark_price)
+        self.monitoring.set_metric("daily_pnl_usd", portfolio.daily_pnl_usd)
 
     def _record_incident(self, severity: str, title: str, details: str) -> None:
         incident = Incident(timestamp=utc_now(), severity=severity, title=title, details=details)

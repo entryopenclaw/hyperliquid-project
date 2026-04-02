@@ -121,6 +121,16 @@ class ExecutionReport:
 
 
 @dataclass(slots=True)
+class PaperPositionState:
+    cash_balance_usd: float
+    position_size: float
+    entry_price: float
+    realized_pnl_usd: float
+    fees_paid_usd: float
+    last_mark_price: float = 0.0
+
+
+@dataclass(slots=True)
 class Incident:
     timestamp: datetime
     severity: str
@@ -142,5 +152,5 @@ class ModelArtifact:
 class TrainingOutcome:
     accepted: bool
     artifact: ModelArtifact
-    metrics: dict[str, float]
+    metrics: dict[str, float
     rejection_reasons: list[str]
