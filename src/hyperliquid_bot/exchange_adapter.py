@@ -128,6 +128,24 @@ class HyperliquidAdapter:
     def get_open_orders(self) -> list[dict[str, Any]]:
         return self._info.open_orders(self.account_address)
 
+    def get_open_orders_for_symbol(self, symbol: str) -> list[dict[str, Any]]:
+        orders = self.get_open_orders()
+        matched: list[dict[str, Any]] = []
+        for order in orders:
+            order_symbol = str(
+                order.get("coin")
+                or order.get("symbol")
+                or order.get("name")
+                or order.get("asset")
+                or order.get("order", {}).get("coin")
+                or order.get("order", {}).get("symbol")
+                or order.get("order", {}).get("name")
+                or ""
+            )
+            if order_symbol == symbol:
+                matched.append(order)
+        return matched
+
     def query_order(self, oid: int) -> dict[str, Any]:
         return self._info.query_order_by_oid(self.account_address, oid)
 
@@ -236,7 +254,7 @@ class HyperliquidAdapter:
 
         margin = raw_state.get("marginSummary", {})
         account_value = float(margin.get("accountValue", 0.0) or 0.0)
-        open_orders = len(self.get_open_orders())
+        open_orders = len(self.get_open_orders_for_symbol(symbol))
         return PortfolioState(
             timestamp=utc_now(),
             symbol=symbol,

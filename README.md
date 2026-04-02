@@ -15,7 +15,7 @@ The bot is designed around:
 - wrapped Hyperliquid exchange adapter
 - market data normalization, startup snapshot bootstrapping, and feature pipeline warmup gating
 - heuristic/learned signal model support
-- policy, risk, execution, monitoring, model registry, and training services
+- policy, risk, execution state reconciliation, monitoring, model registry, and training services
 - CLI entrypoints for live loop, training, backtesting, and health inspection
 - unit-test coverage for config, features, risk/policy, and model promotion rules
 
@@ -49,6 +49,8 @@ hyperliquid-autobot run --config config/bot.toml --mode paper
 3. `live`: allow small **Hyperliquid testnet** orders after stable paper and shadow behavior.
 4. `train`: retrain nightly and promote only when validation gates pass.
 5. `backtest`: generate a fee-aware report from captured feature data before trusting execution changes.
+
+Live and shadow modes now use a stricter execution guard: the bot reconciles exchange positions and open orders into an internal state machine and refuses to send a new live order while reconciliation is pending or old exchange orders are still working.
 
 ## Notes
 

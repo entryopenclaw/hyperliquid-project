@@ -3,7 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .exchange_adapter import HyperliquidAdapter
-from .models import ExecutionReport, FeatureVector, PaperPositionState, PortfolioState, RiskDecision, TradingDecision
+from .models import (
+    ExchangeOrderState,
+    ExecutionReport,
+    FeatureVector,
+    LiveExecutionState,
+    PaperPositionState,
+    PortfolioState,
+    RiskDecision,
+    TradingDecision,
+)
 from .utils import clamp, utc_now
 
 
@@ -41,11 +50,33 @@ class ExecutionEngine:
             realized_pnl_usd=0.0,
             fees_paid_usd=0.0,
         )
+        self.live_states: dict[str, LiveExecutionState] = {}
 
     def reconcile(self, symbol: str, *, mark_price: float | None = None, use_exchange: bool = True) -> PortfolioState:
         if use_exchange:
-            return self.adapter.build_portfolio_state(symbol)
+            return self.sync_exchange_state(symbol)
         return self._paper_portfolio(symbol, mark_price or self.paper_state.last_mark_price)
+
+    def sync_exchange_state(self, symbol: str) -> PortfolioState:
+        portfolio = self.adapter.build_portfolio_state(symbol)
+        open_orders = [self._normalize_open_order(symbol, item) for item in self.adapter.get_open_orders_for_symbol(symbol)]
+        blocked_reason = ""
+        status = "ready"
+        if open_orders:
+            status = "blocked_open_orders"
+            blocked_reason = f"{len(open_orders)} exchange order(s) still open"
+        prior = self.live_states.get(symbol)
+        self.live_states[symbol] = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=symbol,
+            status=status,
+            position_size=portfolio.position_size,
+            open_orders=open_orders,
+            pending_reconcile=False,
+            last_action=prior.last_action if prior else "",
+            blocked_reason=blocked_reason,
+        )
+        return portfolio
 
     def execute(self, decision: TradingDecision, risk: RiskDecision, features: FeatureVector) -> ExecutionReport:
         if not risk.allowed:
@@ -79,13 +110,21 @@ class ExecutionEngine:
                 response={},
             )
 
+        live_block = self._guard_live_execution(decision)
+        if live_block is not None:
+            return live_block
+
         if decision.action == "exit":
             response = self.adapter.close_position(decision.symbol)
-            return self.adapter.safe_report(decision.symbol, "exit", response)
+            report = self.adapter.safe_report(decision.symbol, "exit", response)
+            self._mark_live_action_submitted(decision.symbol, "exit")
+            return report
 
         if decision.order_type == "ioc":
             response = self.adapter.place_ioc_order(decision.symbol, decision.side, quantity)
-            return self.adapter.safe_report(decision.symbol, decision.action, response)
+            report = self.adapter.safe_report(decision.symbol, decision.action, response)
+            self._mark_live_action_submitted(decision.symbol, decision.action)
+            return report
 
         response = self.adapter.place_limit_order(
             decision.symbol,
@@ -94,7 +133,9 @@ class ExecutionEngine:
             float(decision.limit_price or features.mid_price),
             reduce_only=decision.reduce_only,
         )
-        return self.adapter.safe_report(decision.symbol, decision.action, response)
+        report = self.adapter.safe_report(decision.symbol, decision.action, response)
+        self._mark_live_action_submitted(decision.symbol, decision.action)
+        return report
 
     def execute_paper(self, decision: TradingDecision, risk: RiskDecision, features: FeatureVector) -> ExecutionOutcome:
         portfolio = self._paper_portfolio(decision.symbol, features.mid_price)
@@ -311,4 +352,92 @@ class ExecutionEngine:
             realized_pnl_usd=self.paper_state.realized_pnl_usd,
             daily_pnl_usd=account_value - self.paper_starting_balance_usd,
             open_orders=0,
+        )
+
+    def live_state(self, symbol: str) -> LiveExecutionState:
+        return self.live_states.get(
+            symbol,
+            LiveExecutionState(
+                timestamp=utc_now(),
+                symbol=symbol,
+                status="needs_reconcile",
+                position_size=0.0,
+                pending_reconcile=True,
+                blocked_reason="exchange state not reconciled",
+            ),
+        )
+
+    def _guard_live_execution(self, decision: TradingDecision) -> ExecutionReport | None:
+        state = self.live_state(decision.symbol)
+        if state.pending_reconcile or state.status == "needs_reconcile":
+            return ExecutionReport(
+                timestamp=decision.timestamp,
+                symbol=decision.symbol,
+                action=decision.action,
+                success=False,
+                message="exchange state not reconciled",
+                response={"execution_state": state.status},
+            )
+        if state.open_orders:
+            return ExecutionReport(
+                timestamp=decision.timestamp,
+                symbol=decision.symbol,
+                action=decision.action,
+                success=False,
+                message="open exchange orders require reconciliation",
+                response={
+                    "execution_state": state.status,
+                    "open_order_count": len(state.open_orders),
+                },
+            )
+        return None
+
+    def _mark_live_action_submitted(self, symbol: str, action: str) -> None:
+        state = self.live_state(symbol)
+        self.live_states[symbol] = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=symbol,
+            status="needs_reconcile",
+            position_size=state.position_size,
+            open_orders=state.open_orders,
+            pending_reconcile=True,
+            last_action=action,
+            blocked_reason="waiting for post-trade reconciliation",
+        )
+
+    @staticmethod
+    def _normalize_open_order(symbol: str, raw: dict[str, object]) -> ExchangeOrderState:
+        nested = raw.get("order", {})
+        if not isinstance(nested, dict):
+            nested = {}
+        source = {**nested, **raw}
+
+        side = str(source.get("side") or source.get("dir") or "").lower()
+        if not side:
+            is_buy = source.get("isBuy")
+            side = "buy" if bool(is_buy) else "sell"
+
+        order_type = "ioc" if str(source.get("tif") or source.get("orderType") or "").lower() == "ioc" else "limit"
+        timestamp_value = source.get("timestamp") or source.get("time")
+        timestamp = utc_now()
+        if isinstance(timestamp_value, (int, float)) and float(timestamp_value) > 0:
+            from datetime import UTC, datetime
+
+            timestamp = datetime.fromtimestamp(float(timestamp_value) / 1000.0, tz=UTC)
+
+        oid_value = source.get("oid") or source.get("orderId")
+        oid = int(oid_value) if isinstance(oid_value, (int, float)) else None
+        size_value = source.get("sz") or source.get("origSz") or 0.0
+        limit_price_value = source.get("limitPx") or source.get("px") or 0.0
+        reduce_only = bool(source.get("reduceOnly") or source.get("reduce_only"))
+
+        return ExchangeOrderState(
+            oid=oid,
+            symbol=symbol,
+            side=side,
+            size=float(size_value or 0.0),
+            limit_price=float(limit_price_value or 0.0),
+            reduce_only=reduce_only,
+            order_type=order_type,
+            timestamp=timestamp,
         )

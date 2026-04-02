@@ -121,6 +121,30 @@ class ExecutionReport:
 
 
 @dataclass(slots=True)
+class ExchangeOrderState:
+    oid: int | None
+    symbol: str
+    side: str
+    size: float
+    limit_price: float
+    reduce_only: bool
+    order_type: str
+    timestamp: datetime
+
+
+@dataclass(slots=True)
+class LiveExecutionState:
+    timestamp: datetime
+    symbol: str
+    status: str
+    position_size: float
+    open_orders: list[ExchangeOrderState] = field(default_factory=list)
+    pending_reconcile: bool = True
+    last_action: str = ""
+    blocked_reason: str = ""
+
+
+@dataclass(slots=True)
 class PaperPositionState:
     cash_balance_usd: float
     position_size: float
@@ -152,5 +176,5 @@ class ModelArtifact:
 class TrainingOutcome:
     accepted: bool
     artifact: ModelArtifact
-    metrics: dict[str, float
+    metrics: dict[str, float]
     rejection_reasons: list[str]

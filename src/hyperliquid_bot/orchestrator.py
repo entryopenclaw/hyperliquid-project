@@ -82,6 +82,7 @@ class AutonomousBot:
         self.monitoring.set_metric("mode", self.config.execution.mode)
         self.monitoring.set_metric("active_model_version", self.signal.model.version)
         self._update_feature_metrics()
+        self._update_execution_metrics()
         self._update_portfolio_metrics(self.portfolio)
         self._persist_health()
 
@@ -176,6 +177,7 @@ class AutonomousBot:
             }
             self.storage.record_execution(report_payload)
             self.monitoring.set_metric("last_action", f"shadow:{decision.action}")
+            self._update_execution_metrics()
             self._update_portfolio_metrics(self.portfolio)
             self._persist_health()
             return
@@ -189,6 +191,7 @@ class AutonomousBot:
             self.risk.on_reject()
             self._record_incident("warning", "Execution failure", report.message)
         self.monitoring.set_metric("last_action", report.action)
+        self._update_execution_metrics()
         self._update_portfolio_metrics(self.portfolio)
         self._persist_health()
 
@@ -378,6 +381,7 @@ class AutonomousBot:
 
             self.portfolio = self._current_portfolio(mark_price=self.features.last_mid_price())
             self._update_feature_metrics()
+            self._update_execution_metrics()
             self._update_portfolio_metrics(self.portfolio)
             self._persist_health()
         except Exception as exc:
@@ -402,6 +406,18 @@ class AutonomousBot:
         self.monitoring.set_metric("warm_price_points", self.features.reference_price_count())
         self.monitoring.set_metric("last_market_data_at", to_jsonable(self.features.last_market_timestamp()))
         self.monitoring.set_metric("last_mid_price", self.features.last_mid_price())
+
+    def _update_execution_metrics(self) -> None:
+        if self.config.execution.mode not in {"live", "shadow"}:
+            self.monitoring.set_metric("execution_state", "paper")
+            self.monitoring.set_metric("execution_open_orders", 0)
+            return
+        state = self.execution.live_state(self.config.market.symbol)
+        self.monitoring.set_metric("execution_state", state.status)
+        self.monitoring.set_metric("execution_pending_reconcile", state.pending_reconcile)
+        self.monitoring.set_metric("execution_open_orders", len(state.open_orders))
+        self.monitoring.set_metric("execution_last_action", state.last_action)
+        self.monitoring.set_metric("execution_blocked_reason", state.blocked_reason)
 
     def _record_incident(self, severity: str, title: str, details: str) -> None:
         incident = Incident(timestamp=utc_now(), severity=severity, title=title, details=details)
