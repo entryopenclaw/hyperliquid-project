@@ -208,11 +208,37 @@ class HyperliquidAdapter:
         )
 
     def safe_report(self, symbol: str, action: str, response: dict[str, Any], success: bool = True) -> ExecutionReport:
+        parsed_success, message = self._parse_response(response)
         return ExecutionReport(
             timestamp=utc_now(),
             symbol=symbol,
             action=action,
-            success=success,
-            message="ok" if success else "failed",
+            success=success and parsed_success,
+            message=message,
             response=response,
         )
+
+    @staticmethod
+    def _parse_response(response: dict[str, Any]) -> tuple[bool, str]:
+        status = str(response.get("status", "ok")).lower()
+        if status not in {"ok", "success"}:
+            return False, status
+
+        statuses: list[Any] = []
+        response_payload = response.get("response", {})
+        if isinstance(response_payload, dict):
+            data = response_payload.get("data", {})
+            if isinstance(data, dict):
+                statuses = data.get("statuses", [])
+
+        for item in statuses:
+            if not isinstance(item, dict):
+                continue
+            if "error" in item:
+                return False, str(item["error"])
+            if "err" in item:
+                return False, str(item["err"])
+
+        if statuses:
+            return True, "accepted"
+        return True, "ok"

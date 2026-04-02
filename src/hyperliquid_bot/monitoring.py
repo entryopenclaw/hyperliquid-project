@@ -4,6 +4,7 @@ import json
 import logging
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 
 from .config import MonitoringConfig
@@ -46,6 +47,7 @@ class MonitoringService:
         }
 
     def write_status_file(self) -> None:
+        Path(self.status_path).parent.mkdir(parents=True, exist_ok=True)
         with open(self.status_path, "w", encoding="utf-8") as handle:
             json.dump(self.status(), handle, indent=2, sort_keys=True)
 

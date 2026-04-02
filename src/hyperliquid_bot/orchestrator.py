@@ -66,14 +66,18 @@ class AutonomousBot:
         self.monitoring.heartbeat()
 
     def handle_event(self, stream_type: str, message: Any) -> None:
-        envelope = self.market_data.normalize(stream_type, message)
-        self.storage.record_raw_event(
-            {"timestamp": utc_now().isoformat(), "stream_type": stream_type, "payload": to_jsonable(envelope.raw)}
-        )
-        feature = self._route_envelope(envelope)
-        if feature is None:
-            return
-        self._evaluate(feature)
+        try:
+            envelope = self.market_data.normalize(stream_type, message)
+            self.storage.record_raw_event(
+                {"timestamp": utc_now().isoformat(), "stream_type": stream_type, "payload": to_jsonable(envelope.raw)}
+            )
+            feature = self._route_envelope(envelope)
+            if feature is None:
+                return
+            self._evaluate(feature)
+        except Exception as exc:
+            self._record_incident("error", "Event handling failure", str(exc))
+            LOGGER.exception("failed to handle %s event", stream_type)
 
     def _route_envelope(self, envelope) -> FeatureVector | None:
         if envelope.book is not None:
@@ -103,16 +107,16 @@ class AutonomousBot:
         self.portfolio = self.execution.reconcile(self.config.market.symbol)
         decision = self.policy.decide(prediction, feature, self.portfolio)
         risk_decision = self.risk.evaluate(decision, self.portfolio, feature)
+        if (
+            decision.action in {"enter", "add", "flip"}
+            and self.portfolio.open_orders >= self.config.execution.max_open_orders
+        ):
+            risk_decision.allowed = False
+            risk_decision.reasons.append("max open orders reached")
 
         if risk_decision.kill_switch:
-            self.monitoring.report_incident(
-                Incident(
-                    timestamp=utc_now(),
-                    severity="critical",
-                    title="Kill switch engaged",
-                    details=", ".join(risk_decision.reasons),
-                )
-            )
+            self.risk.pause_after_stop()
+            self._record_incident("critical", "Kill switch engaged", ", ".join(risk_decision.reasons))
 
         if self.config.execution.mode == "paper":
             report_payload = {
@@ -126,7 +130,7 @@ class AutonomousBot:
             }
             self.storage.record_execution(report_payload)
             self.monitoring.set_metric("last_action", decision.action)
-            self.monitoring.heartbeat()
+            self._persist_health()
             return
 
         if self.config.execution.mode == "shadow":
@@ -141,7 +145,7 @@ class AutonomousBot:
             }
             self.storage.record_execution(report_payload)
             self.monitoring.set_metric("last_action", f"shadow:{decision.action}")
-            self.monitoring.heartbeat()
+            self._persist_health()
             return
 
         report = self.execution.execute(decision, risk_decision, feature)
@@ -150,8 +154,9 @@ class AutonomousBot:
             self.risk.on_success()
         else:
             self.risk.on_reject()
+            self._record_incident("warning", "Execution failure", report.message)
         self.monitoring.set_metric("last_action", report.action)
-        self.monitoring.heartbeat()
+        self._persist_health()
 
     def run(self) -> None:
         self.bootstrap()
@@ -162,7 +167,7 @@ class AutonomousBot:
                 try:
                     stream_type, message = self.queue.get(timeout=1.0)
                 except queue.Empty:
-                    self.monitoring.heartbeat()
+                    self._persist_health()
                     continue
                 self.handle_event(stream_type, message)
         finally:
@@ -183,12 +188,21 @@ class AutonomousBot:
         return payload
 
     def health(self) -> dict[str, Any]:
-        self.monitoring.heartbeat()
+        self._persist_health()
         status = self.monitoring.status()
         status["portfolio"] = to_jsonable(self.portfolio)
         active = self.registry.load_active()
         status["active_model"] = to_jsonable(active) if active else None
         return status
+
+    def _persist_health(self) -> None:
+        self.monitoring.heartbeat()
+        self.storage.record_health(self.monitoring.status())
+
+    def _record_incident(self, severity: str, title: str, details: str) -> None:
+        incident = Incident(timestamp=utc_now(), severity=severity, title=title, details=details)
+        self.monitoring.report_incident(incident)
+        self.storage.record_incident(to_jsonable(incident))
 
     def shutdown(self) -> None:
         self.monitoring.shutdown()

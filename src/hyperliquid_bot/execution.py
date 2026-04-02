@@ -33,6 +33,16 @@ class ExecutionEngine:
             )
 
         quantity = 0.0 if not features.mid_price else decision.target_notional_usd / features.mid_price
+        if quantity <= 0:
+            return ExecutionReport(
+                timestamp=decision.timestamp,
+                symbol=decision.symbol,
+                action=decision.action,
+                success=False,
+                message="zero order quantity",
+                response={},
+            )
+
         if decision.action == "exit":
             response = self.adapter.close_position(decision.symbol)
             return self.adapter.safe_report(decision.symbol, "exit", response)
