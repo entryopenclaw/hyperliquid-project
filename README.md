@@ -50,7 +50,7 @@ hyperliquid-autobot run --config config/bot.toml --mode paper
 4. `train`: retrain nightly and promote only when validation gates pass.
 5. `backtest`: generate a fee-aware report from captured feature data before trusting execution changes.
 
-Live and shadow modes now use a stricter execution guard: the bot reconciles exchange positions and open orders into an internal state machine, tracks resting order IDs from exchange responses, consumes `orderUpdates` and `userFills` websocket events to clear ambiguity faster, and can cancel stale resting limits so the next decision cycle can refresh them.
+Live and shadow modes now use a stricter execution guard: the bot reconciles exchange positions and open orders into an internal state machine, tracks resting order IDs from exchange responses, consumes `orderUpdates` and `userFills` websocket events to clear ambiguity faster, and can cancel and re-price stale resting limits from the latest market data instead of waiting for a later generic loop.
 
 ## Notes
 

@@ -12,6 +12,7 @@ class _LiveAdapter:
         self.open_orders: list[dict[str, object]] = []
         self.limit_orders: list[tuple[str, str, float, float, bool]] = []
         self.cancelled_orders: list[tuple[str, int]] = []
+        self.next_oid = 123
 
     def build_portfolio_state(self, symbol: str) -> PortfolioState:
         return PortfolioState(
@@ -33,7 +34,9 @@ class _LiveAdapter:
 
     def place_limit_order(self, symbol: str, side: str, size: float, limit_price: float, reduce_only: bool) -> dict[str, object]:
         self.limit_orders.append((symbol, side, size, limit_price, reduce_only))
-        return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 123}}]}}}
+        oid = self.next_oid
+        self.next_oid += 1
+        return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}}}
 
     def place_ioc_order(self, symbol: str, side: str, size: float) -> dict[str, object]:  # pragma: no cover - not used
         return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"totalSz": str(size)}}]}}}
@@ -190,3 +193,42 @@ def test_cancel_stale_orders_marks_state_for_reconcile() -> None:
     assert adapter.cancelled_orders == [("BTC", 123)]
     assert updated.status == "needs_reconcile"
     assert updated.pending_reconcile is True
+
+
+def test_refresh_stale_orders_reprices_remaining_size() -> None:
+    adapter = _LiveAdapter()
+    engine = ExecutionEngine(adapter)  # type: ignore[arg-type]
+    engine.reconcile("BTC", use_exchange=True)
+    state = engine.handle_order_update(
+        {
+            "coin": "BTC",
+            "oid": 123,
+            "side": "buy",
+            "sz": "1.0",
+            "filledSz": "0.4",
+            "limitPx": "100.0",
+            "status": "open",
+            "time": int((utc_now() - timedelta(seconds=60)).timestamp() * 1000),
+        }
+    )
+    adapter.next_oid = 124
+
+    reports = engine.refresh_stale_orders("BTC", max_order_age_s=20, reference_price=101.0, limit_offset_bps=10.0)
+    updated = engine.live_state("BTC")
+
+    assert state is not None
+    assert len(reports) == 2
+    assert reports[0].action == "cancel_stale"
+    assert reports[0].success
+    assert reports[1].action == "replace_stale"
+    assert reports[1].success
+    assert adapter.cancelled_orders == [("BTC", 123)]
+    assert len(adapter.limit_orders) == 1
+    assert adapter.limit_orders[0][:3] == ("BTC", "buy", 0.6)
+    assert abs(adapter.limit_orders[0][3] - 100.899) < 1e-9
+    assert updated.status == "blocked_open_orders"
+    assert updated.pending_reconcile is False
+    assert len(updated.open_orders) == 1
+    assert updated.open_orders[0].oid == 124
+    assert abs(updated.open_orders[0].size - 0.6) < 1e-9
+    assert abs(updated.open_orders[0].limit_price - 100.899) < 1e-9

@@ -405,6 +405,116 @@ class ExecutionEngine:
         )
         return reports
 
+    def refresh_stale_orders(
+        self,
+        symbol: str,
+        *,
+        max_order_age_s: int,
+        reference_price: float,
+        limit_offset_bps: float,
+    ) -> list[ExecutionReport]:
+        state = self.live_state(symbol)
+        if state.pending_reconcile or not state.open_orders or reference_price <= 0:
+            return []
+
+        now = utc_now()
+        stale_orders = [
+            order for order in state.open_orders if order.oid is not None and (now - order.timestamp) >= timedelta(seconds=max_order_age_s)
+        ]
+        if not stale_orders:
+            return []
+
+        reports: list[ExecutionReport] = []
+        open_orders = [item for item in state.open_orders]
+        pending_reconcile = False
+        for order in stale_orders:
+            cancel_response = self.adapter.cancel(symbol, order.oid or 0)
+            cancel_report = self.adapter.safe_report(symbol, "cancel_stale", cancel_response)
+            cancel_report.response["oid"] = order.oid
+            cancel_report.response["age_s"] = max(0.0, (now - order.timestamp).total_seconds())
+            reports.append(cancel_report)
+            if not cancel_report.success:
+                continue
+
+            open_orders = [item for item in open_orders if item.oid != order.oid]
+            remaining_size = max(0.0, order.size - order.filled_size)
+            if remaining_size <= 0:
+                reports.append(
+                    ExecutionReport(
+                        timestamp=utc_now(),
+                        symbol=symbol,
+                        action="replace_stale",
+                        success=True,
+                        message="no remaining size to replace",
+                        response={
+                            "prior_oid": order.oid,
+                            "prior_limit_price": order.limit_price,
+                            "filled_size": order.filled_size,
+                        },
+                    )
+                )
+                continue
+
+            replacement_limit_price = self._replacement_limit_price(order.side, reference_price, limit_offset_bps)
+            replace_response = self.adapter.place_limit_order(
+                symbol,
+                order.side,
+                remaining_size,
+                replacement_limit_price,
+                reduce_only=order.reduce_only,
+            )
+            replace_report = self.adapter.safe_report(symbol, "replace_stale", replace_response)
+            replace_report.response["prior_oid"] = order.oid
+            replace_report.response["prior_limit_price"] = order.limit_price
+            replace_report.response["replacement_limit_price"] = replacement_limit_price
+            replace_report.response["remaining_size"] = remaining_size
+            replace_report.response["filled_size"] = order.filled_size
+            reports.append(replace_report)
+            if not replace_report.success:
+                continue
+
+            replacement_oid = self._extract_resting_oid(replace_report.response)
+            if replacement_oid is None:
+                pending_reconcile = True
+                continue
+
+            open_orders = [item for item in open_orders if item.oid != replacement_oid]
+            open_orders.append(
+                ExchangeOrderState(
+                    oid=replacement_oid,
+                    symbol=symbol,
+                    side=order.side,
+                    size=remaining_size,
+                    limit_price=replacement_limit_price,
+                    reduce_only=order.reduce_only,
+                    order_type=order.order_type,
+                    timestamp=utc_now(),
+                    filled_size=0.0,
+                )
+            )
+
+        if pending_reconcile:
+            status = "needs_reconcile"
+            blocked_reason = "waiting for stale order replacement reconciliation"
+        elif open_orders:
+            status = "blocked_open_orders"
+            blocked_reason = f"{len(open_orders)} exchange order(s) still open"
+        else:
+            status = "ready"
+            blocked_reason = ""
+
+        self.live_states[symbol] = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=symbol,
+            status=status,
+            position_size=state.position_size,
+            open_orders=open_orders,
+            pending_reconcile=pending_reconcile,
+            last_action="replace_stale" if stale_orders else state.last_action,
+            blocked_reason=blocked_reason,
+        )
+        return reports
+
     def handle_order_update(self, raw: dict[str, object]) -> LiveExecutionState | None:
         symbol = self._extract_symbol(raw)
         if not symbol:
@@ -414,7 +524,8 @@ class ExecutionEngine:
         open_orders = [item for item in state.open_orders if item.oid != normalized.oid or normalized.oid is None]
         status_text = str(raw.get("status") or raw.get("order", {}).get("status") or "").lower()
         if self._is_open_order_status(status_text):
-            normalized.filled_size = next((item.filled_size for item in state.open_orders if item.oid == normalized.oid), 0.0)
+            existing_filled = next((item.filled_size for item in state.open_orders if item.oid == normalized.oid), 0.0)
+            normalized.filled_size = max(existing_filled, normalized.filled_size)
             open_orders.append(normalized)
             status = "blocked_open_orders"
             pending_reconcile = False
@@ -580,6 +691,11 @@ class ExecutionEngine:
             last_action=decision.action,
             blocked_reason=f"{len(open_orders)} exchange order(s) still open",
         )
+
+    @staticmethod
+    def _replacement_limit_price(side: str, reference_price: float, limit_offset_bps: float) -> float:
+        offset = reference_price * (limit_offset_bps / 10_000.0)
+        return reference_price - offset if side == "buy" else reference_price + offset
 
     @staticmethod
     def _extract_symbol(raw: dict[str, object]) -> str:

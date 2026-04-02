@@ -410,7 +410,7 @@ class AutonomousBot:
                 self._bootstrap_market_state()
 
             self.portfolio = self._current_portfolio(mark_price=self.features.last_mid_price())
-            self._maybe_cancel_stale_live_orders()
+            self._maybe_refresh_stale_live_orders()
             self._update_feature_metrics()
             self._update_execution_metrics()
             self._update_portfolio_metrics(self.portfolio)
@@ -419,12 +419,14 @@ class AutonomousBot:
             self._record_incident("warning", "Runtime refresh failure", str(exc))
             LOGGER.exception("failed to refresh runtime state")
 
-    def _maybe_cancel_stale_live_orders(self) -> None:
+    def _maybe_refresh_stale_live_orders(self) -> None:
         if self.config.execution.mode != "live":
             return
-        reports = self.execution.cancel_stale_orders(
+        reports = self.execution.refresh_stale_orders(
             self.config.market.symbol,
             max_order_age_s=self.config.execution.resting_order_max_age_s,
+            reference_price=self.features.last_mid_price(),
+            limit_offset_bps=self.config.execution.limit_offset_bps,
         )
         if not reports:
             return
@@ -440,8 +442,11 @@ class AutonomousBot:
             }
             self.storage.record_execution(payload)
             if not report.success:
-                self._record_incident("warning", "Stale order cancel failure", report.message)
-        self.monitoring.set_metric("last_stale_cancel_at", utc_now().isoformat())
+                title = "Stale order cancel failure" if report.action == "cancel_stale" else "Stale order replace failure"
+                self._record_incident("warning", title, report.message)
+        stamp = utc_now().isoformat()
+        self.monitoring.set_metric("last_stale_cancel_at", stamp)
+        self.monitoring.set_metric("last_stale_replace_at", stamp)
 
     def _current_portfolio(self, *, mark_price: float) -> PortfolioState:
         if self.config.execution.mode == "paper":
