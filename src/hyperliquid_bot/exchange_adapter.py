@@ -107,6 +107,21 @@ class HyperliquidAdapter:
     def get_meta(self) -> Any:
         return self._info.meta_and_asset_ctxs()
 
+    def get_asset_context(self, symbol: str) -> dict[str, Any] | None:
+        meta = self.get_meta()
+        if not isinstance(meta, list) or len(meta) != 2:
+            return None
+        universe = meta[0].get("universe", []) if isinstance(meta[0], dict) else []
+        asset_ctxs = meta[1] if isinstance(meta[1], list) else []
+        for idx, asset in enumerate(universe):
+            if asset.get("name") != symbol or idx >= len(asset_ctxs):
+                continue
+            return {
+                "coin": symbol,
+                "ctx": dict(asset_ctxs[idx]),
+            }
+        return None
+
     def get_user_state(self) -> dict[str, Any]:
         return self._info.user_state(self.account_address)
 

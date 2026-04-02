@@ -24,6 +24,8 @@ class MarketConfig:
     candle_interval: str = "1m"
     depth_levels: int = 5
     feature_window: int = 200
+    startup_candle_lookback: int = 30
+    min_warm_price_points: int = 20
 
 
 @dataclass(slots=True)
@@ -131,6 +133,12 @@ class BotConfig:
             raise ValueError("execution.mode must be paper, shadow, or live")
         if self.execution.paper_starting_balance_usd <= 0:
             raise ValueError("execution.paper_starting_balance_usd must be > 0")
+        if self.market.startup_candle_lookback <= 0:
+            raise ValueError("market.startup_candle_lookback must be > 0")
+        if self.market.min_warm_price_points <= 0:
+            raise ValueError("market.min_warm_price_points must be > 0")
+        if self.market.startup_candle_lookback < self.market.min_warm_price_points:
+            raise ValueError("market.startup_candle_lookback must be >= market.min_warm_price_points")
         if self.execution.paper_latency_bps < 0:
             raise ValueError("execution.paper_latency_bps must be >= 0")
         if self.execution.paper_max_latency_bps <= 0:

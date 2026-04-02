@@ -10,6 +10,8 @@ symbol = "BTC"
 candle_interval = "1m"
 depth_levels = 5
 feature_window = 200
+startup_candle_lookback = 30
+min_warm_price_points = 20
 
 [execution]
 mode = "paper"

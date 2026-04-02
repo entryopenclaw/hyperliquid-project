@@ -21,7 +21,7 @@ from .signal_engine import SignalEngine
 from .signal_engine import WeightedFeatureModel
 from .storage import StorageManager
 from .trainer import Trainer
-from .utils import to_jsonable, utc_now
+from .utils import interval_to_milliseconds, to_jsonable, utc_now
 from .backtest import BacktestEngine
 
 LOGGER = logging.getLogger(__name__)
@@ -53,6 +53,8 @@ class AutonomousBot:
         self.backtester = BacktestEngine()
         self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.last_training_check_at: datetime | None = None
+        self.last_reconcile_at: datetime | None = None
+        self.last_market_bootstrap_at: datetime | None = None
         self.portfolio = PortfolioState(
             timestamp=utc_now(),
             symbol=config.market.symbol,
@@ -72,15 +74,14 @@ class AutonomousBot:
         return WeightedFeatureModel.from_artifact(artifact) if artifact else None
 
     def bootstrap(self) -> None:
-        if self.config.execution.mode == "live":
-            self.adapter.connect(require_exchange=True)
-        elif self.config.execution.mode == "shadow" and (self.config.secret_key or self.config.hyperliquid.account_address):
-            self.adapter.connect()
+        self.adapter.connect(require_exchange=self.config.execution.mode == "live")
         self.monitoring.serve()
-        self.portfolio = self._current_portfolio(mark_price=0.0)
+        self._bootstrap_market_state()
+        self.portfolio = self._current_portfolio(mark_price=self.features.last_mid_price())
         self.monitoring.set_metric("account_value_usd", self.portfolio.account_value_usd)
         self.monitoring.set_metric("mode", self.config.execution.mode)
         self.monitoring.set_metric("active_model_version", self.signal.model.version)
+        self._update_feature_metrics()
         self._update_portfolio_metrics(self.portfolio)
         self._persist_health()
 
@@ -113,6 +114,12 @@ class AutonomousBot:
         return None
 
     def _evaluate(self, feature: FeatureVector) -> None:
+        self._update_feature_metrics()
+        if not self.features.is_ready(self.config.market.min_warm_price_points):
+            self.monitoring.set_metric("last_action", "warming")
+            self._persist_health()
+            return
+
         row = {
             "timestamp": feature.timestamp.isoformat(),
             "symbol": feature.symbol,
@@ -194,10 +201,11 @@ class AutonomousBot:
                 try:
                     stream_type, message = self.queue.get(timeout=1.0)
                 except queue.Empty:
+                    self._maybe_refresh_runtime_state()
                     self._maybe_train()
-                    self._persist_health()
                     continue
                 self.handle_event(stream_type, message)
+                self._maybe_refresh_runtime_state()
                 self._maybe_train()
         finally:
             self.shutdown()
@@ -321,6 +329,61 @@ class AutonomousBot:
         self.monitoring.heartbeat()
         self.storage.record_health(self.monitoring.status())
 
+    def _bootstrap_market_state(self) -> None:
+        symbol = self.config.market.symbol
+        end_time = utc_now()
+        candle_ms = interval_to_milliseconds(self.config.market.candle_interval)
+        lookback_ms = candle_ms * self.config.market.startup_candle_lookback
+        start_ms = int((end_time - timedelta(milliseconds=lookback_ms)).timestamp() * 1000)
+        end_ms = int(end_time.timestamp() * 1000)
+
+        try:
+            candles = self.adapter.get_candles(symbol, self.config.market.candle_interval, start_ms, end_ms)
+            for candle in candles[-self.config.market.startup_candle_lookback :]:
+                envelope = self.market_data.normalize("candle", {"data": candle})
+                self._route_envelope(envelope)
+
+            mids = self.adapter.get_all_mids()
+            if mids:
+                self._route_envelope(self.market_data.normalize("allMids", {"data": mids}))
+
+            asset_context = self.adapter.get_asset_context(symbol)
+            if asset_context:
+                self._route_envelope(self.market_data.normalize("activeAssetCtx", {"data": asset_context}))
+
+            book = self.adapter.get_l2_snapshot(symbol)
+            self._route_envelope(self.market_data.normalize("l2Book", {"data": book}))
+
+            self.last_market_bootstrap_at = utc_now()
+            self.monitoring.set_metric("market_bootstrap_status", "ready" if self.features.is_ready(self.config.market.min_warm_price_points) else "warming")
+            self.monitoring.set_metric("last_market_bootstrap_at", self.last_market_bootstrap_at.isoformat())
+            self._update_feature_metrics()
+        except Exception as exc:
+            self.monitoring.set_metric("market_bootstrap_status", "failed")
+            self._record_incident("warning", "Market bootstrap failure", str(exc))
+            LOGGER.exception("failed to bootstrap market state")
+
+    def _maybe_refresh_runtime_state(self) -> None:
+        now = utc_now()
+        interval = timedelta(seconds=self.config.execution.reconcile_interval_s)
+        if self.last_reconcile_at is not None and (now - self.last_reconcile_at) < interval:
+            return
+
+        self.last_reconcile_at = now
+        try:
+            market_ts = self.features.last_market_timestamp()
+            stale_after_s = max(self.config.execution.reconcile_interval_s, int(self.config.risk.max_data_age_s))
+            if market_ts is None or (now - market_ts).total_seconds() > stale_after_s:
+                self._bootstrap_market_state()
+
+            self.portfolio = self._current_portfolio(mark_price=self.features.last_mid_price())
+            self._update_feature_metrics()
+            self._update_portfolio_metrics(self.portfolio)
+            self._persist_health()
+        except Exception as exc:
+            self._record_incident("warning", "Runtime refresh failure", str(exc))
+            LOGGER.exception("failed to refresh runtime state")
+
     def _current_portfolio(self, *, mark_price: float) -> PortfolioState:
         if self.config.execution.mode == "paper":
             return self.execution.reconcile(self.config.market.symbol, mark_price=mark_price, use_exchange=False)
@@ -333,6 +396,12 @@ class AutonomousBot:
         self.monitoring.set_metric("position_size", portfolio.position_size)
         self.monitoring.set_metric("mark_price", portfolio.mark_price)
         self.monitoring.set_metric("daily_pnl_usd", portfolio.daily_pnl_usd)
+
+    def _update_feature_metrics(self) -> None:
+        self.monitoring.set_metric("feature_ready", self.features.is_ready(self.config.market.min_warm_price_points))
+        self.monitoring.set_metric("warm_price_points", self.features.reference_price_count())
+        self.monitoring.set_metric("last_market_data_at", to_jsonable(self.features.last_market_timestamp()))
+        self.monitoring.set_metric("last_mid_price", self.features.last_mid_price())
 
     def _record_incident(self, severity: str, title: str, details: str) -> None:
         incident = Incident(timestamp=utc_now(), severity=severity, title=title, details=details)

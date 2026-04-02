@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 from collections import deque
+from datetime import datetime
 from statistics import mean, pstdev
 
 from .models import AssetContext, CandleBar, FeatureVector, OrderBookSnapshot, TradeTick
@@ -37,6 +38,29 @@ class FeaturePipeline:
             return None
         return self._build(context.symbol, context.timestamp)
 
+    def reference_price_count(self) -> int:
+        return len(self._reference_prices())
+
+    def is_ready(self, min_price_points: int) -> bool:
+        return bool(self.books) and self.reference_price_count() >= min_price_points
+
+    def last_market_timestamp(self) -> datetime | None:
+        timestamps = [
+            container[-1].timestamp
+            for container in (self.books, self.trades, self.candles, self.contexts)
+            if container
+        ]
+        return max(timestamps) if timestamps else None
+
+    def last_mid_price(self) -> float:
+        if self.books:
+            return self.books[-1].mid_price
+        if self.contexts:
+            return self.contexts[-1].mid_price or self.contexts[-1].mark_price
+        if self.candles:
+            return self.candles[-1].close_price
+        return 0.0
+
     def _build(self, symbol: str, timestamp) -> FeatureVector:
         book = self.books[-1]
         bids = book.bids[: self.depth_levels]
@@ -50,16 +74,16 @@ class FeaturePipeline:
         total_flow = sum(abs(size) for size in trade_sizes)
         trade_imbalance = trade_flow / total_flow if total_flow else 0.0
 
-        mids = [item.mid_price for item in self.books if item.mid_price > 0]
+        prices = self._reference_prices()
         recent_returns = []
-        for idx in range(1, len(mids)):
-            prev = mids[idx - 1]
-            curr = mids[idx]
+        for idx in range(1, len(prices)):
+            prev = prices[idx - 1]
+            curr = prices[idx]
             if prev:
                 recent_returns.append((curr - prev) / prev)
 
-        momentum_5 = ((mids[-1] / mids[-5]) - 1.0) if len(mids) >= 5 and mids[-5] else 0.0
-        momentum_20 = ((mids[-1] / mids[-20]) - 1.0) if len(mids) >= 20 and mids[-20] else 0.0
+        momentum_5 = ((prices[-1] / prices[-5]) - 1.0) if len(prices) >= 5 and prices[-5] else 0.0
+        momentum_20 = ((prices[-1] / prices[-20]) - 1.0) if len(prices) >= 20 and prices[-20] else 0.0
         realized_vol = pstdev(recent_returns[-20:]) * math.sqrt(20) if len(recent_returns) >= 2 else 0.0
 
         last_candle = self.candles[-1] if self.candles else None
@@ -100,6 +124,13 @@ class FeaturePipeline:
             mid_price=book.mid_price,
             spread_bps=book.spread_bps,
         )
+
+    def _reference_prices(self) -> list[float]:
+        candle_prices = [item.close_price for item in self.candles if item.close_price > 0]
+        book_prices = [item.mid_price for item in self.books if item.mid_price > 0]
+        if len(book_prices) >= 20:
+            return book_prices
+        return [price for price in [*candle_prices, *book_prices] if price > 0]
 
     @staticmethod
     def _microprice(book: OrderBookSnapshot) -> float:

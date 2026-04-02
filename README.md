@@ -13,7 +13,7 @@ The bot is designed around:
 
 - configuration loading from TOML plus environment secrets
 - wrapped Hyperliquid exchange adapter
-- market data normalization and feature pipeline
+- market data normalization, startup snapshot bootstrapping, and feature pipeline warmup gating
 - heuristic/learned signal model support
 - policy, risk, execution, monitoring, model registry, and training services
 - CLI entrypoints for live loop, training, backtesting, and health inspection
@@ -44,7 +44,7 @@ hyperliquid-autobot run --config config/bot.toml --mode paper
 
 ## Recommended rollout
 
-1. `paper`: consume live testnet data with a local simulated futures portfolio, modeled PnL, deterministic latency penalties, and partial-fill logic, place no exchange orders.
+1. `paper`: consume live testnet data with a local simulated futures portfolio, modeled PnL, deterministic latency penalties, partial-fill logic, and startup snapshot warmup, place no exchange orders.
 2. `shadow`: validate execution intent and exchange/account reconciliation without sending orders.
 3. `live`: allow small **Hyperliquid testnet** orders after stable paper and shadow behavior.
 4. `train`: retrain nightly and promote only when validation gates pass.

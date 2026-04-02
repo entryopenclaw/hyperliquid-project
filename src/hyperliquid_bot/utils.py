@@ -65,3 +65,23 @@ def sigmoid(value: float) -> float:
 
 def clamp(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, value))
+
+
+def interval_to_milliseconds(interval: str) -> int:
+    if not interval:
+        raise ValueError("interval must not be empty")
+    unit = interval[-1].lower()
+    try:
+        value = int(interval[:-1])
+    except ValueError as exc:
+        raise ValueError(f"invalid interval: {interval}") from exc
+
+    multipliers = {
+        "m": 60_000,
+        "h": 3_600_000,
+        "d": 86_400_000,
+        "w": 604_800_000,
+    }
+    if unit not in multipliers:
+        raise ValueError(f"unsupported interval unit: {interval}")
+    return value * multipliers[unit]

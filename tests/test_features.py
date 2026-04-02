@@ -60,3 +60,37 @@ def test_feature_pipeline_builds_microstructure_features() -> None:
     assert features.values["trade_imbalance"] > 0
     assert "realized_vol_20" in features.values
     assert features.values["open_interest"] == 100000.0
+
+
+def test_feature_pipeline_uses_candle_history_during_startup_warmup() -> None:
+    now = datetime.now(tz=UTC)
+    pipeline = FeaturePipeline(depth_levels=2, feature_window=50)
+
+    for idx in range(30):
+        pipeline.ingest_candle(
+            CandleBar(
+                timestamp=now + timedelta(minutes=idx),
+                symbol="BTC",
+                interval="1m",
+                open_price=100.0 + idx,
+                high_price=100.5 + idx,
+                low_price=99.5 + idx,
+                close_price=100.25 + idx,
+                volume=10.0 + idx,
+            )
+        )
+
+    feature = pipeline.ingest_book(
+        OrderBookSnapshot(
+            timestamp=now + timedelta(minutes=31),
+            symbol="BTC",
+            bids=[OrderBookLevel(price=129.9, size=10.0), OrderBookLevel(price=129.8, size=8.0)],
+            asks=[OrderBookLevel(price=130.1, size=9.0), OrderBookLevel(price=130.2, size=7.0)],
+            mid_price=130.0,
+            spread_bps=15.0,
+        )
+    )
+
+    assert pipeline.is_ready(20)
+    assert pipeline.reference_price_count() >= 20
+    assert feature.values["momentum_20"] > 0
