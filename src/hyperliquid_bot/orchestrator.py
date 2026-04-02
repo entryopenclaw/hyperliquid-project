@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import queue
 from dataclasses import asdict
@@ -21,6 +22,7 @@ from .signal_engine import WeightedFeatureModel
 from .storage import StorageManager
 from .trainer import Trainer
 from .utils import to_jsonable, utc_now
+from .backtest import BacktestEngine
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,6 +41,7 @@ class AutonomousBot:
         self.risk = RiskManager(config.risk)
         self.execution = ExecutionEngine(self.adapter)
         self.trainer = Trainer(config.training, self.registry)
+        self.backtester = BacktestEngine()
         self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.last_training_check_at: datetime | None = None
         self.portfolio = PortfolioState(
@@ -231,6 +234,67 @@ class AutonomousBot:
         active = self.registry.load_active()
         status["active_model"] = to_jsonable(active) if active else None
         return status
+
+    def backtest(self, model_version: str | None = None) -> dict[str, Any]:
+        feature_rows = self.storage.load_feature_rows()
+        rows = self.trainer.build_training_rows(feature_rows)
+        if not rows:
+            return {"accepted": False, "reason": "not enough feature rows for backtest"}
+
+        artifact = self.registry.load(model_version) if model_version else self.registry.load_active()
+        if artifact is None:
+            artifact = self._heuristic_artifact()
+
+        evaluation_rows = [
+            {
+                "features": row.features,
+                "future_return_bps": row.future_return_bps,
+                "mid_price": row.mid_price,
+                "notional_usd": self.config.backtest.assumed_notional_usd,
+            }
+            for row in rows
+        ]
+        result = self.backtester.run(
+            evaluation_rows,
+            artifact,
+            notional_usd=self.config.backtest.assumed_notional_usd,
+            fee_bps=self.config.backtest.fee_bps,
+            slippage_bps=self.config.backtest.slippage_bps,
+            min_signal_bps=self.config.backtest.min_signal_bps,
+        )
+        report = self.backtester.to_report(
+            result,
+            artifact,
+            rows=len(evaluation_rows),
+            notional_usd=self.config.backtest.assumed_notional_usd,
+            fee_bps=self.config.backtest.fee_bps,
+            slippage_bps=self.config.backtest.slippage_bps,
+            min_signal_bps=self.config.backtest.min_signal_bps,
+        )
+        report_path = (
+            self.storage.reports_dir
+            / f"backtest-{artifact.version}-{utc_now().strftime('%Y%m%d%H%M%S')}.json"
+        )
+        report_path.write_text(json.dumps(report, indent=2, sort_keys=True), encoding="utf-8")
+        self.monitoring.set_metric("last_backtest_model_version", artifact.version)
+        self.monitoring.set_metric("last_backtest_path", str(report_path))
+        self.monitoring.set_metric("last_backtest_expectancy_bps", result.expectancy_bps)
+        self._persist_health()
+        return {"accepted": True, "report_path": str(report_path), **report}
+
+    @staticmethod
+    def _heuristic_artifact():
+        model = WeightedFeatureModel.heuristic()
+        from .models import ModelArtifact
+
+        return ModelArtifact(
+            version=model.version,
+            model_type="heuristic",
+            created_at=utc_now(),
+            weights=model.weights,
+            intercept=model.intercept,
+            metrics={},
+        )
 
     def _persist_health(self) -> None:
         self.monitoring.heartbeat()

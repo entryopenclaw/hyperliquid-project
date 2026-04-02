@@ -76,6 +76,14 @@ class TrainingConfig:
 
 
 @dataclass(slots=True)
+class BacktestConfig:
+    assumed_notional_usd: float = 100.0
+    fee_bps: float = 0.7
+    slippage_bps: float = 0.8
+    min_signal_bps: float = 0.1
+
+
+@dataclass(slots=True)
 class StorageConfig:
     root_dir: str = "data"
     sqlite_path: str = "data/runtime.db"
@@ -102,6 +110,7 @@ class BotConfig:
     risk: RiskConfig
     strategy: StrategyConfig
     training: TrainingConfig
+    backtest: BacktestConfig
     storage: StorageConfig
     monitoring: MonitoringConfig
     source_path: Path
@@ -121,6 +130,10 @@ class BotConfig:
             raise ValueError("training.validation_rows must be > 0")
         if self.training.retrain_interval_hours <= 0:
             raise ValueError("training.retrain_interval_hours must be > 0")
+        if self.backtest.assumed_notional_usd <= 0:
+            raise ValueError("backtest.assumed_notional_usd must be > 0")
+        if self.backtest.min_signal_bps < 0:
+            raise ValueError("backtest.min_signal_bps must be >= 0")
 
 
 def _defaults() -> dict[str, Any]:
@@ -131,6 +144,7 @@ def _defaults() -> dict[str, Any]:
         "risk": asdict(RiskConfig()),
         "strategy": asdict(StrategyConfig()),
         "training": asdict(TrainingConfig()),
+        "backtest": asdict(BacktestConfig()),
         "storage": asdict(StorageConfig()),
         "monitoring": asdict(MonitoringConfig()),
     }
@@ -144,6 +158,7 @@ def _build(config: dict[str, Any], source_path: Path) -> BotConfig:
         risk=RiskConfig(**config["risk"]),
         strategy=StrategyConfig(**config["strategy"]),
         training=TrainingConfig(**config["training"]),
+        backtest=BacktestConfig(**config["backtest"]),
         storage=StorageConfig(**config["storage"]),
         monitoring=MonitoringConfig(**config["monitoring"]),
         source_path=source_path,

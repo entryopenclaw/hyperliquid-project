@@ -18,6 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.add_argument("--mode", choices=["paper", "shadow", "live"], default=None)
 
     subparsers.add_parser("train", help="Train and evaluate a new model")
+    backtest_parser = subparsers.add_parser("backtest", help="Run fee-aware backtest from captured feature data")
+    backtest_parser.add_argument("--model-version", default=None, help="Specific model version to evaluate")
     subparsers.add_parser("health", help="Print current health snapshot")
     return parser
 
@@ -43,6 +45,9 @@ def main() -> None:
         return
     if args.command == "train":
         print(json.dumps(bot.train(), indent=2, sort_keys=True))
+        return
+    if args.command == "backtest":
+        print(json.dumps(bot.backtest(model_version=args.model_version), indent=2, sort_keys=True))
         return
     if args.command == "health":
         print(json.dumps(bot.health(), indent=2, sort_keys=True))

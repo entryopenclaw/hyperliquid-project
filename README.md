@@ -48,6 +48,7 @@ hyperliquid-autobot run --config config/bot.toml --mode paper
 2. `shadow`: validate execution intent and state reconciliation without sending orders.
 3. `live`: allow small testnet orders only after stable paper and shadow behavior.
 4. `train`: retrain nightly and promote only when validation gates pass.
+5. `backtest`: generate a fee-aware report from captured feature data before trusting execution changes.
 
 ## Notes
 

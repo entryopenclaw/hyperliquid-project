@@ -83,10 +83,13 @@ class Trainer:
         result = self.backtester.run(evaluation_rows, artifact)
         metrics = {
             "expectancy_bps": result.expectancy_bps,
+            "gross_expectancy_bps": result.gross_expectancy_bps,
             "win_rate": result.win_rate,
             "turnover": result.turnover,
             "max_drawdown_usd": result.max_drawdown_usd,
             "total_pnl_usd": result.total_pnl_usd,
+            "gross_pnl_usd": result.gross_pnl_usd,
+            "total_cost_usd": result.total_cost_usd,
             "trades": float(result.trades),
         }
         artifact.metrics = metrics
