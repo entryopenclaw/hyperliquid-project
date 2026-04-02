@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 from .exchange_adapter import HyperliquidAdapter
 from .models import ExecutionReport, FeatureVector, PaperPositionState, PortfolioState, RiskDecision, TradingDecision
-from .utils import utc_now
+from .utils import clamp, utc_now
 
 
 @dataclass(slots=True)
@@ -21,11 +21,19 @@ class ExecutionEngine:
         paper_starting_balance_usd: float = 10_000.0,
         paper_fee_bps: float = 0.0,
         paper_slippage_bps: float = 0.0,
+        paper_latency_bps: float = 0.5,
+        paper_max_latency_bps: float = 3.0,
+        paper_fill_tolerance_bps: float = 2.5,
+        paper_partial_fill_min_fraction: float = 0.25,
     ):
         self.adapter = adapter
         self.paper_starting_balance_usd = paper_starting_balance_usd
         self.paper_fee_bps = paper_fee_bps
         self.paper_slippage_bps = paper_slippage_bps
+        self.paper_latency_bps = paper_latency_bps
+        self.paper_max_latency_bps = paper_max_latency_bps
+        self.paper_fill_tolerance_bps = paper_fill_tolerance_bps
+        self.paper_partial_fill_min_fraction = paper_partial_fill_min_fraction
         self.paper_state = PaperPositionState(
             cash_balance_usd=paper_starting_balance_usd,
             position_size=0.0,
@@ -133,29 +141,119 @@ class ExecutionEngine:
                 portfolio=portfolio,
             )
 
+        fill_ratio = self._paper_fill_ratio(decision, features)
+        filled_quantity = quantity * fill_ratio
+        if filled_quantity <= 0:
+            return ExecutionOutcome(
+                report=ExecutionReport(
+                    timestamp=utc_now(),
+                    symbol=decision.symbol,
+                    action=decision.action,
+                    success=False,
+                    message="paper no fill",
+                    response={
+                        "requested_size": quantity,
+                        "filled_size": 0.0,
+                        "fill_ratio": 0.0,
+                        "latency_bps": self._paper_latency_penalty_bps(features),
+                    },
+                ),
+                portfolio=portfolio,
+            )
+
         fill_price = self._paper_fill_price(decision, features)
-        target_delta = quantity if decision.side == "buy" else -quantity
+        target_delta = filled_quantity if decision.side == "buy" else -filled_quantity
         if decision.action == "flip":
             target_delta = -current_pos + target_delta
         self._apply_paper_fill(target_delta, fill_price)
         updated = self._paper_portfolio(decision.symbol, features.mid_price)
+        filled_size = abs(target_delta)
+        message = "paper fill" if fill_ratio >= 0.999 else "paper partial fill"
         return ExecutionOutcome(
             report=ExecutionReport(
                 timestamp=utc_now(),
                 symbol=decision.symbol,
                 action=decision.action,
                 success=True,
-                message="paper fill",
-                response={"fill_price": fill_price, "filled_size": abs(target_delta)},
+                message=message,
+                response={
+                    "fill_price": fill_price,
+                    "requested_size": quantity,
+                    "filled_size": filled_size,
+                    "fill_ratio": filled_size / quantity if quantity > 0 else 0.0,
+                    "unfilled_size": max(0.0, quantity - filled_size),
+                    "latency_bps": self._paper_latency_penalty_bps(features),
+                },
             ),
             portfolio=updated,
         )
 
     def _paper_fill_price(self, decision: TradingDecision, features: FeatureVector) -> float:
+        adverse_move_bps = self._paper_adverse_move_bps(decision, features)
         if decision.order_type == "limit":
             return float(decision.limit_price or features.mid_price)
-        slip = features.mid_price * (self.paper_slippage_bps / 10_000.0)
+        slip_bps = self.paper_slippage_bps + (features.spread_bps / 2.0) + adverse_move_bps
+        slip = features.mid_price * (slip_bps / 10_000.0)
         return features.mid_price + slip if decision.side == "buy" else features.mid_price - slip
+
+    def _paper_fill_ratio(self, decision: TradingDecision, features: FeatureVector) -> float:
+        if decision.order_type == "ioc" or decision.action == "exit":
+            return 1.0
+
+        limit_price = float(decision.limit_price or features.mid_price)
+        effective_mid = self._paper_effective_mid_price(decision, features)
+        synthetic_touch = self._paper_touch_price(decision.side, effective_mid, features.spread_bps)
+
+        if decision.side == "buy" and limit_price >= synthetic_touch:
+            return 1.0
+        if decision.side == "sell" and limit_price <= synthetic_touch:
+            return 1.0
+
+        distance_bps = self._paper_distance_to_touch_bps(decision.side, limit_price, synthetic_touch)
+        tolerance_bps = self.paper_fill_tolerance_bps + (features.spread_bps / 2.0)
+        proximity = clamp(1.0 - (distance_bps / tolerance_bps), 0.0, 1.0)
+        if proximity <= 0.0:
+            return 0.0
+        return self.paper_partial_fill_min_fraction + (
+            proximity * (1.0 - self.paper_partial_fill_min_fraction)
+        )
+
+    def _paper_effective_mid_price(self, decision: TradingDecision, features: FeatureVector) -> float:
+        adverse_move_bps = self._paper_adverse_move_bps(decision, features)
+        if adverse_move_bps <= 0:
+            return features.mid_price
+        move = features.mid_price * (adverse_move_bps / 10_000.0)
+        return features.mid_price + move if decision.side == "buy" else features.mid_price - move
+
+    def _paper_latency_penalty_bps(self, features: FeatureVector) -> float:
+        realized_vol = abs(features.values.get("realized_vol_20", 0.0))
+        vol_bps = min(realized_vol * 10_000.0 * 0.2, self.paper_max_latency_bps)
+        return clamp(self.paper_latency_bps + vol_bps, 0.0, self.paper_max_latency_bps)
+
+    def _paper_adverse_move_bps(self, decision: TradingDecision, features: FeatureVector) -> float:
+        latency_bps = self._paper_latency_penalty_bps(features)
+        if latency_bps <= 0:
+            return 0.0
+
+        momentum = float(features.values.get("momentum_5", 0.0))
+        trade_imbalance = float(features.values.get("trade_imbalance", 0.0))
+        depth_imbalance = float(features.values.get("depth_imbalance", 0.0))
+        pressure = clamp((momentum * 100.0) + (trade_imbalance * 0.75) - (depth_imbalance * 0.35), -1.0, 1.0)
+        adverse_pressure = max(0.0, pressure) if decision.side == "buy" else max(0.0, -pressure)
+        return latency_bps * (0.25 + (0.75 * adverse_pressure))
+
+    @staticmethod
+    def _paper_touch_price(side: str, mid_price: float, spread_bps: float) -> float:
+        half_spread = mid_price * ((spread_bps / 2.0) / 10_000.0)
+        return mid_price + half_spread if side == "buy" else mid_price - half_spread
+
+    @staticmethod
+    def _paper_distance_to_touch_bps(side: str, limit_price: float, touch_price: float) -> float:
+        if touch_price <= 0:
+            return 0.0
+        if side == "buy":
+            return max(0.0, ((touch_price - limit_price) / touch_price) * 10_000.0)
+        return max(0.0, ((limit_price - touch_price) / touch_price) * 10_000.0)
 
     def _apply_paper_fill(self, delta: float, fill_price: float) -> None:
         if delta == 0:

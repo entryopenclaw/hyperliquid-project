@@ -30,6 +30,10 @@ class MarketConfig:
 class ExecutionConfig:
     mode: str = "paper"
     paper_starting_balance_usd: float = 10_000.0
+    paper_latency_bps: float = 0.5
+    paper_max_latency_bps: float = 3.0
+    paper_fill_tolerance_bps: float = 2.5
+    paper_partial_fill_min_fraction: float = 0.25
     limit_offset_bps: float = 1.0
     ioc_slippage_bps: float = 8.0
     reconcile_interval_s: int = 15
@@ -127,6 +131,16 @@ class BotConfig:
             raise ValueError("execution.mode must be paper, shadow, or live")
         if self.execution.paper_starting_balance_usd <= 0:
             raise ValueError("execution.paper_starting_balance_usd must be > 0")
+        if self.execution.paper_latency_bps < 0:
+            raise ValueError("execution.paper_latency_bps must be >= 0")
+        if self.execution.paper_max_latency_bps <= 0:
+            raise ValueError("execution.paper_max_latency_bps must be > 0")
+        if self.execution.paper_latency_bps > self.execution.paper_max_latency_bps:
+            raise ValueError("execution.paper_latency_bps must be <= execution.paper_max_latency_bps")
+        if self.execution.paper_fill_tolerance_bps <= 0:
+            raise ValueError("execution.paper_fill_tolerance_bps must be > 0")
+        if not 0 < self.execution.paper_partial_fill_min_fraction <= 1:
+            raise ValueError("execution.paper_partial_fill_min_fraction must be in (0, 1]")
         if self.risk.max_position_notional_usd < self.risk.base_order_notional_usd:
             raise ValueError("risk.max_position_notional_usd must be >= base_order_notional_usd")
         if self.training.validation_rows <= 0:

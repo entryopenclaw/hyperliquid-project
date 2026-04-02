@@ -44,6 +44,10 @@ class AutonomousBot:
             paper_starting_balance_usd=config.execution.paper_starting_balance_usd,
             paper_fee_bps=config.backtest.fee_bps,
             paper_slippage_bps=config.backtest.slippage_bps,
+            paper_latency_bps=config.execution.paper_latency_bps,
+            paper_max_latency_bps=config.execution.paper_max_latency_bps,
+            paper_fill_tolerance_bps=config.execution.paper_fill_tolerance_bps,
+            paper_partial_fill_min_fraction=config.execution.paper_partial_fill_min_fraction,
         )
         self.trainer = Trainer(config.training, self.registry)
         self.backtester = BacktestEngine()
@@ -230,7 +234,7 @@ class AutonomousBot:
         self._persist_health()
         return payload
 
-    def _maybe_train(3elf) -> None:
+    def _maybe_train(self) -> None:
         if not self.config.training.enabled:
             return
         now = utc_now()

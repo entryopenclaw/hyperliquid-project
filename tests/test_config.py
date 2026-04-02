@@ -54,3 +54,17 @@ def test_invalid_retrain_interval_raises(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         load_config(config_path)
+
+
+def test_invalid_paper_partial_fill_fraction_raises(tmp_path: Path) -> None:
+    config_path = tmp_path / "bot.toml"
+    config_path.write_text(
+        """
+        [execution]
+        paper_partial_fill_min_fraction = 0
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_config(config_path)

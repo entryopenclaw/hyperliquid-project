@@ -14,6 +14,10 @@ feature_window = 200
 [execution]
 mode = "paper"
 paper_starting_balance_usd = 10000
+paper_latency_bps = 0.5
+paper_max_latency_bps = 3.0
+paper_fill_tolerance_bps = 2.5
+paper_partial_fill_min_fraction = 0.25
 limit_offset_bps = 1.0
 ioc_slippage_bps = 8.0
 reconcile_interval_s = 15
