@@ -92,6 +92,7 @@ class AutonomousBot:
             self.storage.record_raw_event(
                 {"timestamp": utc_now().isoformat(), "stream_type": stream_type, "payload": to_jsonable(envelope.raw)}
             )
+            self._handle_execution_envelope(envelope)
             feature = self._route_envelope(envelope)
             if feature is None:
                 return
@@ -113,6 +114,35 @@ class AutonomousBot:
         if envelope.context is not None:
             return self.features.ingest_context(envelope.context)
         return None
+
+    def _handle_execution_envelope(self, envelope) -> None:
+        if self.config.execution.mode == "paper":
+            return
+
+        changed = False
+        for update in envelope.order_updates:
+            state = self.execution.handle_order_update(update)
+            changed = changed or state is not None
+        for fill in envelope.user_fills:
+            state = self.execution.handle_user_fill(fill)
+            changed = changed or state is not None
+        for cancel in envelope.user_cancels:
+            state = self.execution.handle_user_cancel(cancel)
+            changed = changed or state is not None
+
+        if not changed:
+            return
+
+        self._update_execution_metrics()
+        self.monitoring.set_metric("last_execution_event_at", utc_now().isoformat())
+        if self.config.execution.mode == "live" or (
+            self.config.execution.mode == "shadow"
+            and (self.config.secret_key or self.config.hyperliquid.account_address)
+        ):
+            self.portfolio = self._current_portfolio(mark_price=self.features.last_mid_price())
+            self.last_reconcile_at = utc_now()
+            self._update_portfolio_metrics(self.portfolio)
+        self._persist_health()
 
     def _evaluate(self, feature: FeatureVector) -> None:
         self._update_feature_metrics()

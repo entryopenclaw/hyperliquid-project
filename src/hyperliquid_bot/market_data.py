@@ -22,6 +22,9 @@ class NormalizedEnvelope:
     trades: list[TradeTick] = field(default_factory=list)
     candle: CandleBar | None = None
     context: AssetContext | None = None
+    order_updates: list[dict[str, Any]] = field(default_factory=list)
+    user_fills: list[dict[str, Any]] = field(default_factory=list)
+    user_cancels: list[dict[str, Any]] = field(default_factory=list)
 
 
 class MarketDataService:
@@ -108,5 +111,31 @@ class MarketDataService:
                     open_interest=float(ctx.get("openInterest", 0.0) or 0.0),
                     premium=float(ctx.get("premium", 0.0) or 0.0),
                 )
+
+        elif stream_type == "orderUpdates":
+            payload = raw.get("data", raw)
+            if isinstance(payload, list):
+                envelope.order_updates = [item for item in payload if isinstance(item, dict)]
+            elif isinstance(payload, dict):
+                updates = payload.get("orderUpdates") or payload.get("orders") or payload.get("data") or []
+                if isinstance(updates, list):
+                    envelope.order_updates = [item for item in updates if isinstance(item, dict)]
+
+        elif stream_type == "userFills":
+            payload = raw.get("data", raw)
+            if isinstance(payload, dict):
+                fills = payload.get("fills", [])
+                if isinstance(fills, list):
+                    envelope.user_fills = [item for item in fills if isinstance(item, dict)]
+
+        elif stream_type == "userEvents":
+            payload = raw.get("data", raw)
+            if isinstance(payload, dict):
+                fills = payload.get("fills", [])
+                cancels = payload.get("nonUserCancel", [])
+                if isinstance(fills, list):
+                    envelope.user_fills = [item for item in fills if isinstance(item, dict)]
+                if isinstance(cancels, list):
+                    envelope.user_cancels = [item for item in cancels if isinstance(item, dict)]
 
         return envelope

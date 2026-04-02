@@ -97,3 +97,49 @@ def test_live_execution_marks_state_pending_after_submission() -> None:
     assert state.status == "needs_reconcile"
     assert state.pending_reconcile is True
     assert state.last_action == "enter"
+
+
+def test_order_update_can_mark_live_order_as_resting() -> None:
+    adapter = _LiveAdapter()
+    engine = ExecutionEngine(adapter)  # type: ignore[arg-type]
+    engine.reconcile("BTC", use_exchange=True)
+    engine.execute(_decision(), RiskDecision(allowed=True, reasons=[]), _features())
+
+    state = engine.handle_order_update(
+        {"coin": "BTC", "oid": 123, "side": "buy", "sz": "1.0", "limitPx": "100.0", "status": "resting"}
+    )
+
+    assert state is not None
+    assert state.status == "blocked_open_orders"
+    assert state.pending_reconcile is False
+    assert len(state.open_orders) == 1
+
+
+def test_user_fill_clears_pending_reconcile_when_no_open_orders_remain() -> None:
+    adapter = _LiveAdapter()
+    engine = ExecutionEngine(adapter)  # type: ignore[arg-type]
+    engine.reconcile("BTC", use_exchange=True)
+    engine.execute(_decision(), RiskDecision(allowed=True, reasons=[]), _features())
+
+    state = engine.handle_user_fill({"coin": "BTC", "oid": 123, "side": "buy", "sz": "1.0", "startPosition": "0.0"})
+
+    assert state is not None
+    assert state.status == "ready"
+    assert state.pending_reconcile is False
+    assert state.position_size == 1.0
+
+
+def test_user_cancel_removes_open_order_from_live_state() -> None:
+    adapter = _LiveAdapter()
+    engine = ExecutionEngine(adapter)  # type: ignore[arg-type]
+    engine.reconcile("BTC", use_exchange=True)
+    engine.handle_order_update(
+        {"coin": "BTC", "oid": 123, "side": "buy", "sz": "1.0", "limitPx": "100.0", "status": "open"}
+    )
+
+    state = engine.handle_user_cancel({"coin": "BTC", "oid": 123})
+
+    assert state is not None
+    assert state.status == "ready"
+    assert state.pending_reconcile is False
+    assert state.open_orders == []

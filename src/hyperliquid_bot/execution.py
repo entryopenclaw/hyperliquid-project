@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from .exchange_adapter import HyperliquidAdapter
 from .models import (
@@ -367,6 +368,88 @@ class ExecutionEngine:
             ),
         )
 
+    def handle_order_update(self, raw: dict[str, object]) -> LiveExecutionState | None:
+        symbol = self._extract_symbol(raw)
+        if not symbol:
+            return None
+        state = self.live_state(symbol)
+        normalized = self._normalize_open_order(symbol, raw)
+        open_orders = [item for item in state.open_orders if item.oid != normalized.oid or normalized.oid is None]
+        status_text = str(raw.get("status") or raw.get("order", {}).get("status") or "").lower()
+        if self._is_open_order_status(status_text):
+            open_orders.append(normalized)
+            status = "blocked_open_orders"
+            pending_reconcile = False
+            blocked_reason = f"{len(open_orders)} exchange order(s) still open"
+        else:
+            status = "ready"
+            pending_reconcile = False
+            blocked_reason = ""
+
+        updated = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=symbol,
+            status=status,
+            position_size=state.position_size,
+            open_orders=open_orders,
+            pending_reconcile=pending_reconcile,
+            last_action=state.last_action,
+            blocked_reason=blocked_reason,
+        )
+        self.live_states[symbol] = updated
+        return updated
+
+    def handle_user_fill(self, raw: dict[str, object]) -> LiveExecutionState | None:
+        symbol = self._extract_symbol(raw)
+        if not symbol:
+            return None
+        state = self.live_state(symbol)
+        oid_value = raw.get("oid") or raw.get("orderId")
+        oid = int(oid_value) if isinstance(oid_value, (int, float)) else None
+        open_orders = [item for item in state.open_orders if item.oid != oid or oid is None]
+        start_position = self._coerce_float(raw.get("startPosition"))
+        fill_size = self._coerce_float(raw.get("sz"))
+        side = str(raw.get("side") or raw.get("dir") or "").lower()
+        signed_delta = fill_size if side == "buy" else -fill_size
+        position_size = start_position + signed_delta if fill_size else state.position_size
+        status = "blocked_open_orders" if open_orders else "ready"
+        blocked_reason = f"{len(open_orders)} exchange order(s) still open" if open_orders else ""
+        updated = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=symbol,
+            status=status,
+            position_size=position_size,
+            open_orders=open_orders,
+            pending_reconcile=False,
+            last_action=state.last_action,
+            blocked_reason=blocked_reason,
+        )
+        self.live_states[symbol] = updated
+        return updated
+
+    def handle_user_cancel(self, raw: dict[str, object]) -> LiveExecutionState | None:
+        symbol = self._extract_symbol(raw)
+        if not symbol:
+            return None
+        state = self.live_state(symbol)
+        oid_value = raw.get("oid") or raw.get("orderId")
+        oid = int(oid_value) if isinstance(oid_value, (int, float)) else None
+        open_orders = [item for item in state.open_orders if item.oid != oid or oid is None]
+        status = "blocked_open_orders" if open_orders else "ready"
+        blocked_reason = f"{len(open_orders)} exchange order(s) still open" if open_orders else ""
+        updated = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=symbol,
+            status=status,
+            position_size=state.position_size,
+            open_orders=open_orders,
+            pending_reconcile=False,
+            last_action=state.last_action,
+            blocked_reason=blocked_reason,
+        )
+        self.live_states[symbol] = updated
+        return updated
+
     def _guard_live_execution(self, decision: TradingDecision) -> ExecutionReport | None:
         state = self.live_state(decision.symbol)
         if state.pending_reconcile or state.status == "needs_reconcile":
@@ -406,6 +489,38 @@ class ExecutionEngine:
         )
 
     @staticmethod
+    def _extract_symbol(raw: dict[str, object]) -> str:
+        nested = raw.get("order", {})
+        if not isinstance(nested, dict):
+            nested = {}
+        value = (
+            raw.get("coin")
+            or raw.get("symbol")
+            or raw.get("name")
+            or nested.get("coin")
+            or nested.get("symbol")
+            or nested.get("name")
+            or ""
+        )
+        return str(value)
+
+    @staticmethod
+    def _coerce_float(value: object) -> float:
+        try:
+            return float(value or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _is_open_order_status(status: str) -> bool:
+        if not status:
+            return False
+        lowered = status.lower()
+        if any(token in lowered for token in ("filled", "cancel", "reject", "error", "expire")):
+            return False
+        return any(token in lowered for token in ("open", "resting", "trigger", "working", "active"))
+
+    @staticmethod
     def _normalize_open_order(symbol: str, raw: dict[str, object]) -> ExchangeOrderState:
         nested = raw.get("order", {})
         if not isinstance(nested, dict):
@@ -421,8 +536,6 @@ class ExecutionEngine:
         timestamp_value = source.get("timestamp") or source.get("time")
         timestamp = utc_now()
         if isinstance(timestamp_value, (int, float)) and float(timestamp_value) > 0:
-            from datetime import UTC, datetime
-
             timestamp = datetime.fromtimestamp(float(timestamp_value) / 1000.0, tz=UTC)
 
         oid_value = source.get("oid") or source.get("orderId")
