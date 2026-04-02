@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from .exchange_adapter import HyperliquidAdapter
 from .models import (
@@ -135,7 +135,10 @@ class ExecutionEngine:
             reduce_only=decision.reduce_only,
         )
         report = self.adapter.safe_report(decision.symbol, decision.action, response)
-        self._mark_live_action_submitted(decision.symbol, decision.action)
+        if report.success:
+            self._track_submitted_limit_order(decision, quantity, float(decision.limit_price or features.mid_price), report)
+        else:
+            self._mark_live_action_submitted(decision.symbol, decision.action)
         return report
 
     def execute_paper(self, decision: TradingDecision, risk: RiskDecision, features: FeatureVector) -> ExecutionOutcome:
@@ -368,6 +371,40 @@ class ExecutionEngine:
             ),
         )
 
+    def cancel_stale_orders(self, symbol: str, *, max_order_age_s: int) -> list[ExecutionReport]:
+        state = self.live_state(symbol)
+        if state.pending_reconcile or not state.open_orders:
+            return []
+
+        now = utc_now()
+        stale_orders = [
+            order for order in state.open_orders if order.oid is not None and (now - order.timestamp) >= timedelta(seconds=max_order_age_s)
+        ]
+        if not stale_orders:
+            return []
+
+        reports: list[ExecutionReport] = []
+        for order in stale_orders:
+            response = self.adapter.cancel(symbol, order.oid or 0)
+            report = self.adapter.safe_report(symbol, "cancel_stale", response)
+            report.response["oid"] = order.oid
+            report.response["age_s"] = max(0.0, (now - order.timestamp).total_seconds())
+            reports.append(report)
+
+        remaining_open_orders = [order for order in state.open_orders if order not in stale_orders]
+        all_success = all(report.success for report in reports)
+        self.live_states[symbol] = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=symbol,
+            status="needs_reconcile" if all_success else "blocked_open_orders",
+            position_size=state.position_size,
+            open_orders=remaining_open_orders if not all_success else state.open_orders,
+            pending_reconcile=all_success,
+            last_action=state.last_action,
+            blocked_reason="cancelling stale resting order(s)" if all_success else state.blocked_reason,
+        )
+        return reports
+
     def handle_order_update(self, raw: dict[str, object]) -> LiveExecutionState | None:
         symbol = self._extract_symbol(raw)
         if not symbol:
@@ -377,6 +414,7 @@ class ExecutionEngine:
         open_orders = [item for item in state.open_orders if item.oid != normalized.oid or normalized.oid is None]
         status_text = str(raw.get("status") or raw.get("order", {}).get("status") or "").lower()
         if self._is_open_order_status(status_text):
+            normalized.filled_size = next((item.filled_size for item in state.open_orders if item.oid == normalized.oid), 0.0)
             open_orders.append(normalized)
             status = "blocked_open_orders"
             pending_reconcile = False
@@ -406,12 +444,29 @@ class ExecutionEngine:
         state = self.live_state(symbol)
         oid_value = raw.get("oid") or raw.get("orderId")
         oid = int(oid_value) if isinstance(oid_value, (int, float)) else None
-        open_orders = [item for item in state.open_orders if item.oid != oid or oid is None]
         start_position = self._coerce_float(raw.get("startPosition"))
         fill_size = self._coerce_float(raw.get("sz"))
         side = str(raw.get("side") or raw.get("dir") or "").lower()
         signed_delta = fill_size if side == "buy" else -fill_size
         position_size = start_position + signed_delta if fill_size else state.position_size
+        open_orders: list[ExchangeOrderState] = []
+        for item in state.open_orders:
+            if oid is None or item.oid != oid:
+                open_orders.append(item)
+                continue
+            open_orders.append(
+                ExchangeOrderState(
+                    oid=item.oid,
+                    symbol=item.symbol,
+                    side=item.side,
+                    size=item.size,
+                    limit_price=item.limit_price,
+                    reduce_only=item.reduce_only,
+                    order_type=item.order_type,
+                    timestamp=item.timestamp,
+                    filled_size=item.filled_size + fill_size,
+                )
+            )
         status = "blocked_open_orders" if open_orders else "ready"
         blocked_reason = f"{len(open_orders)} exchange order(s) still open" if open_orders else ""
         updated = LiveExecutionState(
@@ -488,6 +543,44 @@ class ExecutionEngine:
             blocked_reason="waiting for post-trade reconciliation",
         )
 
+    def _track_submitted_limit_order(
+        self,
+        decision: TradingDecision,
+        quantity: float,
+        limit_price: float,
+        report: ExecutionReport,
+    ) -> None:
+        state = self.live_state(decision.symbol)
+        oid = self._extract_resting_oid(report.response)
+        if oid is None:
+            self._mark_live_action_submitted(decision.symbol, decision.action)
+            return
+
+        open_orders = [item for item in state.open_orders if item.oid != oid]
+        open_orders.append(
+            ExchangeOrderState(
+                oid=oid,
+                symbol=decision.symbol,
+                side=decision.side,
+                size=quantity,
+                limit_price=limit_price,
+                reduce_only=decision.reduce_only,
+                order_type=decision.order_type,
+                timestamp=utc_now(),
+                filled_size=0.0,
+            )
+        )
+        self.live_states[decision.symbol] = LiveExecutionState(
+            timestamp=utc_now(),
+            symbol=decision.symbol,
+            status="blocked_open_orders",
+            position_size=state.position_size,
+            open_orders=open_orders,
+            pending_reconcile=False,
+            last_action=decision.action,
+            blocked_reason=f"{len(open_orders)} exchange order(s) still open",
+        )
+
     @staticmethod
     def _extract_symbol(raw: dict[str, object]) -> str:
         nested = raw.get("order", {})
@@ -521,6 +614,28 @@ class ExecutionEngine:
         return any(token in lowered for token in ("open", "resting", "trigger", "working", "active"))
 
     @staticmethod
+    def _extract_resting_oid(response: dict[str, object]) -> int | None:
+        response_payload = response.get("response", {})
+        if not isinstance(response_payload, dict):
+            return None
+        data = response_payload.get("data", {})
+        if not isinstance(data, dict):
+            return None
+        statuses = data.get("statuses", [])
+        if not isinstance(statuses, list):
+            return None
+        for item in statuses:
+            if not isinstance(item, dict):
+                continue
+            resting = item.get("resting")
+            if not isinstance(resting, dict):
+                continue
+            oid_value = resting.get("oid")
+            if isinstance(oid_value, (int, float)):
+                return int(oid_value)
+        return None
+
+    @staticmethod
     def _normalize_open_order(symbol: str, raw: dict[str, object]) -> ExchangeOrderState:
         nested = raw.get("order", {})
         if not isinstance(nested, dict):
@@ -543,6 +658,7 @@ class ExecutionEngine:
         size_value = source.get("sz") or source.get("origSz") or 0.0
         limit_price_value = source.get("limitPx") or source.get("px") or 0.0
         reduce_only = bool(source.get("reduceOnly") or source.get("reduce_only"))
+        filled_size_value = source.get("filledSz") or source.get("cumSz") or 0.0
 
         return ExchangeOrderState(
             oid=oid,
@@ -553,4 +669,5 @@ class ExecutionEngine:
             reduce_only=reduce_only,
             order_type=order_type,
             timestamp=timestamp,
+            filled_size=float(filled_size_value or 0.0),
         )

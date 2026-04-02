@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from hyperliquid_bot.execution import ExecutionEngine
 from hyperliquid_bot.models import ExecutionReport, FeatureVector, PortfolioState, RiskDecision, TradingDecision
@@ -11,6 +11,7 @@ class _LiveAdapter:
     def __init__(self) -> None:
         self.open_orders: list[dict[str, object]] = []
         self.limit_orders: list[tuple[str, str, float, float, bool]] = []
+        self.cancelled_orders: list[tuple[str, int]] = []
 
     def build_portfolio_state(self, symbol: str) -> PortfolioState:
         return PortfolioState(
@@ -39,6 +40,10 @@ class _LiveAdapter:
 
     def close_position(self, symbol: str) -> dict[str, object]:  # pragma: no cover - not used
         return {"status": "ok", "response": {"data": {"statuses": [{"filled": {"coin": symbol}}]}}}
+
+    def cancel(self, symbol: str, oid: int) -> dict[str, object]:
+        self.cancelled_orders.append((symbol, oid))
+        return {"status": "ok", "response": {"data": {"statuses": [{"cancelled": {"oid": oid}}]}}}
 
     def safe_report(self, symbol: str, action: str, response: dict[str, object], success: bool = True) -> ExecutionReport:
         return ExecutionReport(timestamp=utc_now(), symbol=symbol, action=action, success=success, message="accepted", response=dict(response))
@@ -94,9 +99,11 @@ def test_live_execution_marks_state_pending_after_submission() -> None:
 
     assert report.success
     assert len(adapter.limit_orders) == 1
-    assert state.status == "needs_reconcile"
-    assert state.pending_reconcile is True
+    assert state.status == "blocked_open_orders"
+    assert state.pending_reconcile is False
     assert state.last_action == "enter"
+    assert len(state.open_orders) == 1
+    assert state.open_orders[0].oid == 123
 
 
 def test_order_update_can_mark_live_order_as_resting() -> None:
@@ -119,14 +126,27 @@ def test_user_fill_clears_pending_reconcile_when_no_open_orders_remain() -> None
     adapter = _LiveAdapter()
     engine = ExecutionEngine(adapter)  # type: ignore[arg-type]
     engine.reconcile("BTC", use_exchange=True)
-    engine.execute(_decision(), RiskDecision(allowed=True, reasons=[]), _features())
 
-    state = engine.handle_user_fill({"coin": "BTC", "oid": 123, "side": "buy", "sz": "1.0", "startPosition": "0.0"})
+    state = engine.handle_user_fill({"coin": "BTC", "oid": 999, "side": "buy", "sz": "1.0", "startPosition": "0.0"})
 
     assert state is not None
     assert state.status == "ready"
     assert state.pending_reconcile is False
     assert state.position_size == 1.0
+
+
+def test_user_fill_updates_tracked_open_order_without_removing_it() -> None:
+    adapter = _LiveAdapter()
+    engine = ExecutionEngine(adapter)  # type: ignore[arg-type]
+    engine.reconcile("BTC", use_exchange=True)
+    engine.execute(_decision(), RiskDecision(allowed=True, reasons=[]), _features())
+
+    state = engine.handle_user_fill({"coin": "BTC", "oid": 123, "side": "buy", "sz": "0.4", "startPosition": "0.0"})
+
+    assert state is not None
+    assert state.status == "blocked_open_orders"
+    assert len(state.open_orders) == 1
+    assert state.open_orders[0].filled_size == 0.4
 
 
 def test_user_cancel_removes_open_order_from_live_state() -> None:
@@ -143,3 +163,30 @@ def test_user_cancel_removes_open_order_from_live_state() -> None:
     assert state.status == "ready"
     assert state.pending_reconcile is False
     assert state.open_orders == []
+
+
+def test_cancel_stale_orders_marks_state_for_reconcile() -> None:
+    adapter = _LiveAdapter()
+    engine = ExecutionEngine(adapter)  # type: ignore[arg-type]
+    engine.reconcile("BTC", use_exchange=True)
+    state = engine.handle_order_update(
+        {
+            "coin": "BTC",
+            "oid": 123,
+            "side": "buy",
+            "sz": "1.0",
+            "limitPx": "100.0",
+            "status": "open",
+            "time": int((utc_now() - timedelta(seconds=60)).timestamp() * 1000),
+        }
+    )
+
+    reports = engine.cancel_stale_orders("BTC", max_order_age_s=20)
+    updated = engine.live_state("BTC")
+
+    assert state is not None
+    assert len(reports) == 1
+    assert reports[0].success
+    assert adapter.cancelled_orders == [("BTC", 123)]
+    assert updated.status == "needs_reconcile"
+    assert updated.pending_reconcile is True

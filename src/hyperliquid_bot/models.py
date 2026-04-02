@@ -130,6 +130,7 @@ class ExchangeOrderState:
     reduce_only: bool
     order_type: str
     timestamp: datetime
+    filled_size: float = 0.0
 
 
 @dataclass(slots=True)

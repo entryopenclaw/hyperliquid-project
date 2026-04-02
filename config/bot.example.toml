@@ -20,6 +20,7 @@ paper_latency_bps = 0.5
 paper_max_latency_bps = 3.0
 paper_fill_tolerance_bps = 2.5
 paper_partial_fill_min_fraction = 0.25
+resting_order_max_age_s = 20
 limit_offset_bps = 1.0
 ioc_slippage_bps = 8.0
 reconcile_interval_s = 15

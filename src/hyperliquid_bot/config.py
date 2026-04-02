@@ -36,6 +36,7 @@ class ExecutionConfig:
     paper_max_latency_bps: float = 3.0
     paper_fill_tolerance_bps: float = 2.5
     paper_partial_fill_min_fraction: float = 0.25
+    resting_order_max_age_s: int = 20
     limit_offset_bps: float = 1.0
     ioc_slippage_bps: float = 8.0
     reconcile_interval_s: int = 15
@@ -149,6 +150,8 @@ class BotConfig:
             raise ValueError("execution.paper_fill_tolerance_bps must be > 0")
         if not 0 < self.execution.paper_partial_fill_min_fraction <= 1:
             raise ValueError("execution.paper_partial_fill_min_fraction must be in (0, 1]")
+        if self.execution.resting_order_max_age_s <= 0:
+            raise ValueError("execution.resting_order_max_age_s must be > 0")
         if self.risk.max_position_notional_usd < self.risk.base_order_notional_usd:
             raise ValueError("risk.max_position_notional_usd must be >= base_order_notional_usd")
         if self.training.validation_rows <= 0:

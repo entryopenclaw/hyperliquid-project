@@ -410,6 +410,7 @@ class AutonomousBot:
                 self._bootstrap_market_state()
 
             self.portfolio = self._current_portfolio(mark_price=self.features.last_mid_price())
+            self._maybe_cancel_stale_live_orders()
             self._update_feature_metrics()
             self._update_execution_metrics()
             self._update_portfolio_metrics(self.portfolio)
@@ -417,6 +418,30 @@ class AutonomousBot:
         except Exception as exc:
             self._record_incident("warning", "Runtime refresh failure", str(exc))
             LOGGER.exception("failed to refresh runtime state")
+
+    def _maybe_cancel_stale_live_orders(self) -> None:
+        if self.config.execution.mode != "live":
+            return
+        reports = self.execution.cancel_stale_orders(
+            self.config.market.symbol,
+            max_order_age_s=self.config.execution.resting_order_max_age_s,
+        )
+        if not reports:
+            return
+
+        for report in reports:
+            payload = {
+                "timestamp": utc_now().isoformat(),
+                "symbol": report.symbol,
+                "action": report.action,
+                "success": report.success,
+                "mode": "live",
+                "execution": to_jsonable(report),
+            }
+            self.storage.record_execution(payload)
+            if not report.success:
+                self._record_incident("warning", "Stale order cancel failure", report.message)
+        self.monitoring.set_metric("last_stale_cancel_at", utc_now().isoformat())
 
     def _current_portfolio(self, *, mark_price: float) -> PortfolioState:
         if self.config.execution.mode == "paper":

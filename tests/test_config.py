@@ -83,3 +83,17 @@ def test_startup_lookback_must_cover_warm_points(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         load_config(config_path)
+
+
+def test_invalid_resting_order_max_age_raises(tmp_path: Path) -> None:
+    config_path = tmp_path / "bot.toml"
+    config_path.write_text(
+        """
+        [execution]
+        resting_order_max_age_s = 0
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError):
+        load_config(config_path)
