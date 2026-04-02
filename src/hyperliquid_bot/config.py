@@ -119,6 +119,8 @@ class BotConfig:
             raise ValueError("risk.max_position_notional_usd must be >= base_order_notional_usd")
         if self.training.validation_rows <= 0:
             raise ValueError("training.validation_rows must be > 0")
+        if self.training.retrain_interval_hours <= 0:
+            raise ValueError("training.retrain_interval_hours must be > 0")
 
 
 def _defaults() -> dict[str, Any]:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 from dataclasses import asdict
+from datetime import datetime, timedelta
 from typing import Any
 
 from .config import BotConfig
@@ -39,6 +40,7 @@ class AutonomousBot:
         self.execution = ExecutionEngine(self.adapter)
         self.trainer = Trainer(config.training, self.registry)
         self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.last_training_check_at: datetime | None = None
         self.portfolio = PortfolioState(
             timestamp=utc_now(),
             symbol=config.market.symbol,
@@ -63,7 +65,8 @@ class AutonomousBot:
         self.portfolio = self.execution.reconcile(self.config.market.symbol)
         self.monitoring.set_metric("account_value_usd", self.portfolio.account_value_usd)
         self.monitoring.set_metric("mode", self.config.execution.mode)
-        self.monitoring.heartbeat()
+        self.monitoring.set_metric("active_model_version", self.signal.model.version)
+        self._persist_health()
 
     def handle_event(self, stream_type: str, message: Any) -> None:
         try:
@@ -167,16 +170,29 @@ class AutonomousBot:
                 try:
                     stream_type, message = self.queue.get(timeout=1.0)
                 except queue.Empty:
+                    self._maybe_train()
                     self._persist_health()
                     continue
                 self.handle_event(stream_type, message)
+                self._maybe_train()
         finally:
             self.shutdown()
 
     def train(self) -> dict[str, Any]:
-        outcome = self.trainer.train(self.storage.load_feature_rows())
+        outcome = self._run_training_cycle()
         if outcome is None:
             return {"accepted": False, "reason": "not enough training rows"}
+        return outcome
+
+    def _run_training_cycle(self) -> dict[str, Any] | None:
+        outcome = self.trainer.train(self.storage.load_feature_rows())
+        self.last_training_check_at = utc_now()
+        if outcome is None:
+            self.monitoring.set_metric("last_training_status", "not_enough_rows")
+            self.monitoring.set_metric("last_training_at", self.last_training_check_at.isoformat())
+            self._persist_health()
+            return None
+
         payload = {
             "timestamp": utc_now().isoformat(),
             "accepted": outcome.accepted,
@@ -185,7 +201,28 @@ class AutonomousBot:
             "reasons": outcome.rejection_reasons,
         }
         self.storage.record_training_run(payload)
+        self.monitoring.set_metric("last_training_status", "accepted" if outcome.accepted else "rejected")
+        self.monitoring.set_metric("last_training_at", payload["timestamp"])
+        self.monitoring.set_metric("last_training_model_version", outcome.artifact.version)
+        if outcome.accepted:
+            self.signal.load_model(outcome.artifact)
+            self.monitoring.set_metric("active_model_version", outcome.artifact.version)
+        self._persist_health()
         return payload
+
+    def _maybe_train(self) -> None:
+        if not self.config.training.enabled:
+            return
+        now = utc_now()
+        interval = timedelta(hours=self.config.training.retrain_interval_hours)
+        if self.last_training_check_at is not None and (now - self.last_training_check_at) < interval:
+            return
+        try:
+            self._run_training_cycle()
+        except Exception as exc:
+            self.last_training_check_at = now
+            self._record_incident("error", "Training cycle failure", str(exc))
+            LOGGER.exception("scheduled training cycle failed")
 
     def health(self) -> dict[str, Any]:
         self._persist_health()
