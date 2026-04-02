@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import logging
+import queue
+from dataclasses import asdict
+from typing import Any
+
+from .config import BotConfig
+from .execution import ExecutionEngine
+from .exchange_adapter import HyperliquidAdapter
+from .features import FeaturePipeline
+from .market_data import MarketDataService
+from .model_registry import ModelRegistry
+from .models import FeatureVector, Incident, PortfolioState
+from .monitoring import MonitoringService
+from .policy import PolicyEngine
+from .risk import RiskManager
+from .signal_engine import SignalEngine
+from .signal_engine import WeightedFeatureModel
+from .storage import StorageManager
+from .trainer import Trainer
+from .utils import to_jsonable, utc_now
+
+LOGGER = logging.getLogger(__name__)
+
+
+class AutonomousBot:
+    def __init__(self, config: BotConfig):
+        self.config = config
+        self.storage = StorageManager(config.storage)
+        self.registry = ModelRegistry(config.storage.models_dir)
+        self.monitoring = MonitoringService(config.monitoring, config.storage.status_path)
+        self.adapter = HyperliquidAdapter(config)
+        self.market_data = MarketDataService(config.market.symbol)
+        self.features = FeaturePipeline(config.market.depth_levels, config.market.feature_window)
+        self.signal = SignalEngine(self._load_model())
+        self.policy = PolicyEngine(config.strategy, config.risk, config.execution)
+        self.risk = RiskManager(config.risk)
+        self.execution = ExecutionEngine(self.adapter)
+        self.trainer = Trainer(config.training, self.registry)
+        self.queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+        self.portfolio = PortfolioState(
+            timestamp=utc_now(),
+            symbol=config.market.symbol,
+            account_value_usd=0.0,
+            position_size=0.0,
+            entry_price=0.0,
+            mark_price=0.0,
+            leverage=0.0,
+            unrealized_pnl_usd=0.0,
+            realized_pnl_usd=0.0,
+            daily_pnl_usd=0.0,
+            open_orders=0,
+        )
+
+    def _load_model(self):
+        artifact = self.registry.load_active()
+        return WeightedFeatureModel.from_artifact(artifact) if artifact else None
+
+    def bootstrap(self) -> None:
+        self.adapter.connect()
+        self.monitoring.serve()
+        self.portfolio = self.execution.reconcile(self.config.market.symbol)
+        self.monitoring.set_metric("account_value_usd", self.portfolio.account_value_usd)
+        self.monitoring.set_metric("mode", self.config.execution.mode)
+        self.monitoring.heartbeat()
+
+    def handle_event(self, stream_type: str, message: Any) -> None:
+        envelope = self.market_data.normalize(stream_type, message)
+        self.storage.record_raw_event(
+            {"timestamp": utc_now().isoformat(), "stream_type": stream_type, "payload": to_jsonable(envelope.raw)}
+        )
+        feature = self._route_envelope(envelope)
+        if feature is None:
+            return
+        self._evaluate(feature)
+
+    def _route_envelope(self, envelope) -> FeatureVector | None:
+        if envelope.book is not None:
+            return self.features.ingest_book(envelope.book)
+        if envelope.trades:
+            feature = None
+            for trade in envelope.trades:
+                feature = self.features.ingest_trade(trade)
+            return feature
+        if envelope.candle is not None:
+            return self.features.ingest_candle(envelope.candle)
+        if envelope.context is not None:
+            return self.features.ingest_context(envelope.context)
+        return None
+
+    def _evaluate(self, feature: FeatureVector) -> None:
+        row = {
+            "timestamp": feature.timestamp.isoformat(),
+            "symbol": feature.symbol,
+            "mid_price": feature.mid_price,
+            "spread_bps": feature.spread_bps,
+            "features": feature.values,
+        }
+        self.storage.record_feature_row(row)
+        prediction = self.signal.predict(feature)
+        self.monitoring.set_metric("latest_expected_return_bps", prediction.expected_return_bps)
+        self.portfolio = self.execution.reconcile(self.config.market.symbol)
+        decision = self.policy.decide(prediction, feature, self.portfolio)
+        risk_decision = self.risk.evaluate(decision, self.portfolio, feature)
+
+        if risk_decision.kill_switch:
+            self.monitoring.report_incident(
+                Incident(
+                    timestamp=utc_now(),
+                    severity="critical",
+                    title="Kill switch engaged",
+                    details=", ".join(risk_decision.reasons),
+                )
+            )
+
+        if self.config.execution.mode == "paper":
+            report_payload = {
+                "timestamp": utc_now().isoformat(),
+                "symbol": decision.symbol,
+                "action": decision.action,
+                "success": risk_decision.allowed,
+                "mode": "paper",
+                "decision": to_jsonable(decision),
+                "risk": to_jsonable(risk_decision),
+            }
+            self.storage.record_execution(report_payload)
+            self.monitoring.set_metric("last_action", decision.action)
+            self.monitoring.heartbeat()
+            return
+
+        if self.config.execution.mode == "shadow":
+            report_payload = {
+                "timestamp": utc_now().isoformat(),
+                "symbol": decision.symbol,
+                "action": decision.action,
+                "success": risk_decision.allowed,
+                "mode": "shadow",
+                "decision": to_jsonable(decision),
+                "risk": to_jsonable(risk_decision),
+            }
+            self.storage.record_execution(report_payload)
+            self.monitoring.set_metric("last_action", f"shadow:{decision.action}")
+            self.monitoring.heartbeat()
+            return
+
+        report = self.execution.execute(decision, risk_decision, feature)
+        self.storage.record_execution(to_jsonable(asdict(report)))
+        if report.success:
+            self.risk.on_success()
+        else:
+            self.risk.on_reject()
+        self.monitoring.set_metric("last_action", report.action)
+        self.monitoring.heartbeat()
+
+    def run(self) -> None:
+        self.bootstrap()
+        self.adapter.subscribe_market_streams(self.config.market.symbol, lambda stream, msg: self.queue.put((stream, msg)))
+        LOGGER.info("bot running in %s mode for %s", self.config.execution.mode, self.config.market.symbol)
+        try:
+            while True:
+                try:
+                    stream_type, message = self.queue.get(timeout=1.0)
+                except queue.Empty:
+                    self.monitoring.heartbeat()
+                    continue
+                self.handle_event(stream_type, message)
+        finally:
+            self.shutdown()
+
+    def train(self) -> dict[str, Any]:
+        outcome = self.trainer.train(self.storage.load_feature_rows())
+        if outcome is None:
+            return {"accepted": False, "reason": "not enough training rows"}
+        payload = {
+            "timestamp": utc_now().isoformat(),
+            "accepted": outcome.accepted,
+            "model_version": outcome.artifact.version,
+            "metrics": outcome.metrics,
+            "reasons": outcome.rejection_reasons,
+        }
+        self.storage.record_training_run(payload)
+        return payload
+
+    def health(self) -> dict[str, Any]:
+        self.monitoring.heartbeat()
+        status = self.monitoring.status()
+        status["portfolio"] = to_jsonable(self.portfolio)
+        active = self.registry.load_active()
+        status["active_model"] = to_jsonable(active) if active else None
+        return status
+
+    def shutdown(self) -> None:
+        self.monitoring.shutdown()
+        self.adapter.close()
